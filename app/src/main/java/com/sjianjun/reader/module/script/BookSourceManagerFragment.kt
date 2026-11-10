@@ -235,7 +235,19 @@ class BookSourceManagerFragment : BaseAsyncFragment() {
                     bindingDialog.editView.setText(it)
                 }
                 bindingDialog.tvImportLocal.click {
-                    importSource.launch(arrayOf("*/*"))
+                    // */* 保证文件选择器能选到 .py 和 .zip
+                    importSource.launch(
+                        arrayOf(
+                            "*/*",
+                            "text/x-python",
+                            "application/x-python",
+                            "text/plain",
+                            "application/json",
+                            "application/zip",
+                            "application/x-zip-compressed",
+                            "application/octet-stream"
+                        )
+                    )
                 }
                 val dialog = MaterialAlertDialogBuilder(requireContext())
                     .setOnDismissListener {
