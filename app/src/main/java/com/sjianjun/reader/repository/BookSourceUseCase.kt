@@ -93,33 +93,100 @@ object BookSourceUseCase {
 }
 
 fun parsePySource(sourceUrl: SourceUrl, body: String, dest: MutableList<BookSource>): Boolean {
-    try {
-        if (!body.contains("pySource")) {
-            Log.i("不是修仙py书源")
-            return false
+    // 1. JSON 批量书源（含 pySource）。解析成功就按原来的方式入库。
+    if (body.contains("pySource")) {
+        val parsed = mutableListOf<BookSource>()
+        try {
+            val source = gson.fromJson<Source>(body)
+            source?.pySource?.forEach { pySource ->
+                parsed.add(
+                    BookSource().apply {
+                        name = pySource.source!!
+                        group = sourceUrl.group
+                        js = pySource.js!!
+                        version = pySource.version
+                        enable = pySource.enable
+                        requestDelay = pySource.requestDelay
+                        lauanage = BookSource.Language.py
+                        comment = pySource.comment ?: ""
+                    }
+                )
+            }
+            dest.addAll(parsed)
+            Log.i("解析书源成功：${sourceUrl.group}，共${dest.size}个书源")
+            return true
+        } catch (e: Exception) {
+            Log.e("解析JSON书源失败", e)
+            // 不是合法 JSON 时继续尝试单个 .py 脚本
         }
-        val source = gson.fromJson<Source>(body)
-        source?.pySource?.forEach { pySource ->
-            dest.add(
-                BookSource().apply {
-                    name = pySource.source!!
-                    group = sourceUrl.group
-                    js = pySource.js!!
-                    version = pySource.version
-                    enable = pySource.enable
-                    requestDelay = pySource.requestDelay
-                    lauanage = BookSource.Language.py
-                    comment = pySource.comment ?: ""
-                }
-            )
+    }
 
-        }
-        Log.i("解析书源成功：${sourceUrl.group}，共${dest.size}个书源")
-        return true
-    } catch (e: Exception) {
-        Log.e("解析书源失败", e)
+    // 2. 单个 Python 脚本（本地 .py 或脚本 URL），和粘贴脚本新建书源一样写入 js。
+    if (!body.contains("def getDetails") && !body.contains("def getChapterContent")) {
+        Log.i("不是修仙py书源")
         return false
     }
+
+    // 去掉 if __name__ == 之后的本地测试代码
+    val script = body.split("if __name__ ==")[0].trim() + "\n"
+    val name = extractSourceNameFromUrl(sourceUrl.url)
+
+    dest.add(
+        BookSource().apply {
+            this.name = name
+            group = sourceUrl.group
+            js = script
+            version = 1
+            enable = true
+            requestDelay = -1
+            lauanage = BookSource.Language.py
+            comment = ""
+        }
+    )
+
+    Log.i("解析Python脚本书源成功：${sourceUrl.group}：$name")
+    return true
+}
+
+/**
+ * 从 URL 或文件路径取出书源名称。
+ * 例如 https://example.com/sources/笔趣阁.py → "笔趣阁"
+ *      content://.../document/abc%2Ftest.py → "test"
+ */
+internal fun extractSourceNameFromUrl(url: String): String {
+    return try {
+        val lastSegment = lastPathSegment(url) ?: return "导入书源"
+        // SAF 解码后路径里可能还带 /，再取最后一段
+        val filename = lastSegment.substringAfterLast("/").substringBefore("?")
+        val name = filename.substringBeforeLast(".", filename)
+        name.ifBlank { "导入书源" }
+    } catch (e: Exception) {
+        "导入书源"
+    }
+}
+
+/**
+ * 等价于 Android [android.net.Uri.getLastPathSegment]：丢掉 query，按 / 切分后对最后一段做百分号解码。
+ * 用纯 JVM 实现，本地 .py 导入可以在单元测试里验证，不依赖 android.net.Uri。
+ */
+private fun lastPathSegment(url: String): String? {
+    val noQuery = url.substringBefore("#").substringBefore("?")
+    val path = if (noQuery.contains("://")) {
+        val afterScheme = noQuery.substringAfter("://")
+        val slash = afterScheme.indexOf('/')
+        if (slash < 0) return null
+        afterScheme.substring(slash)
+    } else {
+        noQuery
+    }
+    val raw = path.trimEnd('/').substringAfterLast('/')
+    if (raw.isEmpty()) return null
+    return percentDecode(raw)
+}
+
+private fun percentDecode(value: String): String {
+    // Uri.decode 不把 '+' 当成空格
+    return java.net.URLDecoder.decode(value.replace("+", "%2B"), Charsets.UTF_8)
 }
 
 

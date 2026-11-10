@@ -235,7 +235,17 @@ class BookSourceManagerFragment : BaseAsyncFragment() {
                     bindingDialog.editView.setText(it)
                 }
                 bindingDialog.tvImportLocal.click {
-                    importSource.launch(arrayOf("*/*"))
+                    // */* 保证文件选择器能选到 .py（很多来源把 .py 标成 text/plain 或 octet-stream）
+                    importSource.launch(
+                        arrayOf(
+                            "*/*",
+                            "text/x-python",
+                            "application/x-python",
+                            "text/plain",
+                            "application/json",
+                            "application/octet-stream"
+                        )
+                    )
                 }
                 val dialog = MaterialAlertDialogBuilder(requireContext())
                     .setOnDismissListener {
