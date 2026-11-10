@@ -235,7 +235,7 @@ class BookSourceManagerFragment : BaseAsyncFragment() {
                     bindingDialog.editView.setText(it)
                 }
                 bindingDialog.tvImportLocal.click {
-                    // */* 保证文件选择器能选到 .py（很多来源把 .py 标成 text/plain 或 octet-stream）
+                    // */* 保证文件选择器能选到 .py 和 .zip
                     importSource.launch(
                         arrayOf(
                             "*/*",
@@ -243,6 +243,8 @@ class BookSourceManagerFragment : BaseAsyncFragment() {
                             "application/x-python",
                             "text/plain",
                             "application/json",
+                            "application/zip",
+                            "application/x-zip-compressed",
                             "application/octet-stream"
                         )
                     )

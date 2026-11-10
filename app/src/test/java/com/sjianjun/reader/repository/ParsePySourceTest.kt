@@ -6,6 +6,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 
 /**
  * 书源导入：单个 .py 脚本走和粘贴脚本相同的字段，原有 pySource JSON 批量导入保持不变。
@@ -84,6 +87,54 @@ class ParsePySourceTest {
     fun `文件名取不出来时用导入书源`() {
         assertEquals("导入书源", extractSourceNameFromUrl("content://authority"))
         assertEquals("test", extractSourceNameFromUrl("content://auth/document/abc%2Ftest.py"))
+    }
+
+    @Test
+    fun `zip里每个py按文件名建成书源`() {
+        val zip = zipOf(
+            "天天小說（优+++）__www.example.com.py" to script,
+            "天天小說（优+++）__other.example.com.py" to script,
+            "subdir/笔趣阁.py" to script,
+            "__pycache__/skip.py" to script,
+            "notes.txt" to script,
+            "not_source.py" to "print('hi')\n"
+        )
+        val dest = mutableListOf<BookSource>()
+        val ok = parseZipPySources(SourceUrl("content://local/sources.zip", "自建书源"), zip, dest)
+
+        assertTrue(ok)
+        assertEquals(listOf("天天小說（优+++）", "天天小說（优+++）", "笔趣阁"), dest.map { it.name })
+        assertTrue(dest.all { it.group == "自建书源" && it.lauanage == BookSource.Language.py })
+        assertEquals("自建书源:天天小說（优+++）__www.example.com", dest[0].id)
+        assertEquals("自建书源:天天小說（优+++）__other.example.com", dest[1].id)
+        assertEquals("自建书源:笔趣阁", dest[2].id)
+        assertFalse(dest[0].js.contains("if __name__"))
+        assertEquals("天天小說（优+++）", sourceNameFromStem("天天小說（优+++）__www.example.com"))
+        assertEquals("笔趣阁", sourceNameFromStem("笔趣阁"))
+    }
+
+    @Test
+    fun `空zip或没有py书源时失败`() {
+        val dest = mutableListOf<BookSource>()
+        val ok = parseZipPySources(
+            SourceUrl("content://local/empty.zip", "自建书源"),
+            zipOf("readme.txt" to "hello"),
+            dest
+        )
+        assertFalse(ok)
+        assertTrue(dest.isEmpty())
+    }
+
+    private fun zipOf(vararg entries: Pair<String, String>): ByteArray {
+        val out = ByteArrayOutputStream()
+        ZipOutputStream(out, Charsets.UTF_8).use { zip ->
+            entries.forEach { (name, text) ->
+                zip.putNextEntry(ZipEntry(name))
+                zip.write(text.toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+        }
+        return out.toByteArray()
     }
 
     @Test
