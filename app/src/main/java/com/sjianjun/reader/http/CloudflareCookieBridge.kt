@@ -24,6 +24,8 @@ import java.util.concurrent.TimeUnit
  * 3. Only when a challenge is detected (or cookies missing) open
  *    [WebViewVerificationActivity] so interactive Turnstile can be completed by the user.
  * 4. Return cookie + UA together — clearance is bound to the UA that earned it.
+ * 5. Also return the WebView HTML for the challenged URL when it is no longer a CF page,
+ *    because Python `requests` often still fails CF after clearance (TLS fingerprint).
  */
 object CloudflareCookieBridge {
 
@@ -40,16 +42,28 @@ object CloudflareCookieBridge {
         val userAgent: String,
         val expiresAtMs: Long,
         val host: String,
+        /** Optional HTML captured from the CF WebView after clearance (avoids brittle TLS retries). */
+        val html: String = "",
+        val htmlUrl: String = "",
     ) {
         fun isExpired(now: Long = System.currentTimeMillis()): Boolean = now >= expiresAtMs
 
         /** Map shape expected by Python (Chaquopy). */
-        fun toMap(): Map<String, String> = mapOf(
-            "cookie" to cookie,
-            "userAgent" to userAgent,
-            "host" to host,
-            "expiresAtMs" to expiresAtMs.toString(),
-        )
+        fun toMap(includeHtml: Boolean = false): Map<String, String> {
+            val out = linkedMapOf(
+                "cookie" to cookie,
+                "userAgent" to userAgent,
+                "host" to host,
+                "expiresAtMs" to expiresAtMs.toString(),
+            )
+            // HTML is only for the request that just finished CF WebView — never reuse from cache
+            // (would serve a book page body for a later toc/chapter URL).
+            if (includeHtml && html.isNotBlank()) {
+                out["html"] = html
+                out["htmlUrl"] = htmlUrl.ifBlank { "https://$host/" }
+            }
+            return out
+        }
     }
 
     /**
@@ -64,7 +78,7 @@ object CloudflareCookieBridge {
             cache.remove(host, creds)
             return null
         }
-        return creds.toMap()
+        return creds.toMap(includeHtml = false)
     }
 
     /**
@@ -81,7 +95,12 @@ object CloudflareCookieBridge {
         if (!CloudflareChallengeDetector.hasClearanceCookie(cookie)) {
             return null
         }
-        val ua = preferredUserAgent?.takeIf { it.isNotBlank() } ?: defaultWebViewUserAgent()
+        // Clearance is bound to the WebView UA that earned it — never pair CookieManager
+        // cookies with a book-source mobile UA (that makes CF reject the Python retry).
+        val ua = defaultWebViewUserAgent()
+        if (!preferredUserAgent.isNullOrBlank() && preferredUserAgent != ua) {
+            Log.i("CloudflareCookieBridge ignoring source UA for CookieManager clearance")
+        }
         val creds = Credentials(
             cookie = cookie,
             userAgent = ua,
@@ -92,7 +111,7 @@ object CloudflareCookieBridge {
         // Mirror cache under the twin host (www ↔ bare) so either form reuses clearance.
         twinHost(host)?.let { twin -> cache.putIfAbsent(twin, creds.copy(host = twin)) }
         Log.i("CloudflareCookieBridge refreshed cookies for $host")
-        return creds.toMap()
+        return creds.toMap(includeHtml = false)
     }
 
     /**
@@ -211,18 +230,24 @@ object CloudflareCookieBridge {
             Log.i("CloudflareCookieBridge using WebView UA instead of source UA for CF solve")
         }
 
-        // Challenge interstitial is zone-scoped; loading site origin avoids deep-link quirks
-        // (www redirects, book pages that embed differently). Fall back to original url.
-        val challengeUrl = challengeEntryUrl(url)
+        // Load the challenged URL itself (book page / search) so after Turnstile the WebView
+        // lands on real content we can hand back to Python — requests TLS often still fails CF.
+        val challengeUrl = url
 
-        Log.i("CloudflareCookieBridge opening WebView for CF challenge: $challengeUrl (from $url)")
+        Log.i("CloudflareCookieBridge opening WebView for CF challenge: $challengeUrl")
+        var pageHtml = ""
+        var pageUrl = challengeUrl
         try {
-            WebViewVerificationActivity.startAndWaitResult(
+            val json = WebViewVerificationActivity.startAndWaitResult(
                 url = challengeUrl,
                 headerMap = webHeaders,
                 verificationKey = "",
                 autoCfClearance = true,
             )
+            parseWebViewResult(json)?.let { (finalUrl, html) ->
+                pageUrl = finalUrl.ifBlank { challengeUrl }
+                pageHtml = html
+            }
         } catch (e: ScriptTaskCancelledException) {
             throw e
         } catch (e: Exception) {
@@ -236,28 +261,41 @@ object CloudflareCookieBridge {
             Log.e("CloudflareCookieBridge no cf_clearance after WebView for $host")
             return null
         }
+        val usableHtml = pageHtml.takeIf { html ->
+            html.isNotBlank() &&
+                !CloudflareChallengeDetector.isChallenge(
+                    200,
+                    mapOf("server" to "cloudflare"),
+                    html.take(8192),
+                )
+        }.orEmpty()
         val creds = Credentials(
             cookie = cookie,
             userAgent = ua,
             expiresAtMs = System.currentTimeMillis() + DEFAULT_TTL_MS,
             host = host,
+            html = usableHtml,
+            htmlUrl = pageUrl,
         )
         cache[host] = creds
         twinHost(host)?.let { twin -> cache[twin] = creds.copy(host = twin) }
-        Log.i("CloudflareCookieBridge solved CF for $host")
-        return creds.toMap()
+        Log.i(
+            "CloudflareCookieBridge solved CF for $host htmlLen=${usableHtml.length} pageUrl=$pageUrl"
+        )
+        // includeHtml=true only on the live solve path (not cache hits).
+        return creds.toMap(includeHtml = true)
     }
 
-    /** Prefer https://host/ for the interstitial; keep path for non-http(s) edge cases. */
-    private fun challengeEntryUrl(url: String): String {
+    private fun parseWebViewResult(json: String?): Pair<String, String>? {
+        if (json.isNullOrBlank()) return null
         return try {
-            val uri = URI(url)
-            val host = uri.host ?: return url
-            val scheme = (uri.scheme ?: "https").lowercase()
-            if (scheme != "http" && scheme != "https") return url
-            "$scheme://$host/"
-        } catch (_: Exception) {
-            url
+            val obj = org.json.JSONObject(json)
+            val html = obj.optString("html", "")
+            val finalUrl = obj.optString("url", "")
+            if (html.isBlank()) null else finalUrl to html
+        } catch (e: Exception) {
+            Log.e("CloudflareCookieBridge parse WebView JSON failed", e)
+            null
         }
     }
 

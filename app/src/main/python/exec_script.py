@@ -492,6 +492,105 @@ def _prefetch_cf_credentials(url, headers):
         return None
 
 
+def _creds_map(creds):
+    """Normalize Chaquopy Map / dict into a plain Python dict of strings."""
+    if not creds:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in dict(creds).items()}
+    except Exception:
+        try:
+            out = {}
+            for k in creds.keySet().toArray() if hasattr(creds, "keySet") else []:
+                out[str(k)] = str(creds.get(k))
+            return out
+        except Exception:
+            return {}
+
+
+def _synthetic_html_response(url, html, encoding="utf-8"):
+    """Build a requests.Response from WebView HTML so sources keep using raise_for_status/.text."""
+    import requests
+    from requests.models import Response
+    text = html if isinstance(html, str) else (html or "")
+    body = text.encode(encoding, errors="replace")
+    resp = Response()
+    resp.status_code = 200
+    resp.reason = "OK"
+    resp.url = url or ""
+    resp.encoding = encoding
+    resp._content = body
+    resp.headers = requests.structures.CaseInsensitiveDict({
+        "Content-Type": "text/html; charset=%s" % encoding,
+        "Content-Length": str(len(body)),
+    })
+    return resp
+
+
+def _html_from_cf_creds(creds, request_url):
+    """Use WebView HTML only when it belongs to this request URL (same path)."""
+    data = _creds_map(creds)
+    html = data.get("html") or ""
+    if not html.strip():
+        return None
+    if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+        return None
+    html_url = data.get("htmlUrl") or ""
+    if html_url and request_url:
+        try:
+            from urllib.parse import urlparse
+            a = urlparse(request_url)
+            b = urlparse(html_url)
+            # Same host (+ www twin) and same path → safe to reuse page body.
+            ha = (a.hostname or "").lower().lstrip("www.")
+            hb = (b.hostname or "").lower().lstrip("www.")
+            pa = (a.path or "/").rstrip("/")
+            pb = (b.path or "/").rstrip("/")
+            if ha and hb and ha == hb and pa == pb:
+                return html
+            # Homepage solve for a deeper path is not usable as book HTML.
+            if pa and pa != pb:
+                return None
+        except Exception:
+            pass
+    # No htmlUrl or parse failed — only accept for this request if caller just solved it.
+    return html
+
+
+def _webview_fetch_html(url, creds):
+    """Headless WebView fetch after CF cookies are in CookieManager (requests TLS often still fails)."""
+    if not url:
+        return None
+    check_aborted()
+    try:
+        from java.util import HashMap
+        from com.sjianjun.reader.http import WebViewClient
+        headers = HashMap()
+        data = _creds_map(creds)
+        ua = data.get("userAgent") or ""
+        if ua:
+            headers.put("User-Agent", ua)
+        raw = WebViewClient.get(url, headers, "document.documentElement.outerHTML", 45000)
+        if not raw:
+            return None
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(payload, dict):
+            html = payload.get("html") or ""
+        else:
+            html = str(payload)
+        if not html.strip():
+            return None
+        if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+            return None
+        return html
+    except ScriptAborted:
+        raise
+    except BaseException as e:
+        if is_cancelled_exception(e):
+            raise ScriptAborted("脚本任务已取消")
+        return None
+
+
 def _install_requests_hooks():
     """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时 + CF cookie 桥。"""
     try:
@@ -527,19 +626,36 @@ def _install_requests_hooks():
             already = getattr(self, _CF_RETRY_ATTR, False)
             if (not already) and url and _is_cf_challenge_response(response):
                 check_aborted()
-                # Drop stale CookieManager clearance that caused a still-challenged response.
-                solved = _ensure_cf_credentials(url, _header_dict(kwargs), force=True)
-                if solved:
-                    try:
-                        setattr(self, _CF_RETRY_ATTR, True)
+                try:
+                    setattr(self, _CF_RETRY_ATTR, True)
+                    # requests TLS often still 403s with a valid cf_clearance (needProxy sites).
+                    # If CookieManager already has clearance, try headless WebView first —
+                    # do NOT force-clear (that would make the user solve CF again for toc/chapters).
+                    existing = _prefetch_cf_credentials(url, _header_dict(kwargs))
+                    if existing and (_creds_map(existing).get("cookie") or ""):
+                        html = _webview_fetch_html(url, existing)
+                        if html:
+                            return _synthetic_html_response(url, html)
+
+                    # Interactive CF WebView (clears stale clearance, waits for fresh cookie).
+                    solved = _ensure_cf_credentials(url, _header_dict(kwargs), force=True)
+                    if solved:
+                        html = _html_from_cf_creds(solved, url)
+                        if html:
+                            return _synthetic_html_response(
+                                _creds_map(solved).get("htmlUrl") or url, html
+                            )
                         retry_kwargs = _apply_cf_credentials(dict(kwargs), solved)
                         response = orig_request(self, *args, **retry_kwargs)
-                        # If retry is still challenged, leave it for the script; user can retry.
-                    finally:
-                        try:
-                            setattr(self, _CF_RETRY_ATTR, False)
-                        except Exception:
-                            pass
+                        if _is_cf_challenge_response(response):
+                            html = _webview_fetch_html(url, solved)
+                            if html:
+                                return _synthetic_html_response(url, html)
+                finally:
+                    try:
+                        setattr(self, _CF_RETRY_ATTR, False)
+                    except Exception:
+                        pass
             return response
 
         requests.Session.request = _mark_patched(request)

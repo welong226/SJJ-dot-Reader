@@ -151,21 +151,15 @@ class SearchViewModel : ViewModel() {
                         toast(BookSource.YUEDU_UNSUPPORTED)
                     }
                     Log.e("获取书籍详情失败 ${source.name} url:$bookUrl", e)
-                    // Still return a clickable hit so URL paste is never a silent no-op
-                    // (searchDisabled sources / CF failures previously showed empty with no toast).
-                    SearchResult().also {
-                        it.bookSource = source
-                        it.bookTitle = bookTitleFromUrl(bookUrl)
-                        it.bookUrl = bookUrl
-                        it.bookAuthor = source.name
-                        it.latestChapter = "详情待加载"
-                    }
+                    // Do not invent a path-id stub (e.g. title=83216 / author=书源名) — that looks
+                    // like success but cannot open. Caller toasts when every source fails.
+                    null
                 }
             }
         }
         val results = books.awaitAll().filterNotNull()
         if (results.isEmpty()) {
-            toast("链接导入失败")
+            toast("获取书籍详情失败，请完成验证后重试")
             return@withIo flowOf(emptyList())
         }
         val group = mutableMapOf<String, MutableList<SearchResult>>()

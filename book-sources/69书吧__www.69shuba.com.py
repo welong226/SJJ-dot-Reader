@@ -1506,24 +1506,20 @@ def _query_as_book_url(source, query):
 
 
 def _search_hit_from_book_url(source, book_url):
-    """Build one search hit from a pasted book URL (searchDisabled / URL-only sources)."""
-    title = ""
-    author = ""
-    cover = None
-    latest = None
-    try:
-        details = run_details(source, book_url, "")
-        if isinstance(details, dict):
-            title = (details.get("title") or details.get("bookTitle") or "").strip()
-            author = (details.get("author") or details.get("bookAuthor") or "").strip()
-            cover = details.get("cover") or details.get("bookCover")
-            latest = details.get("latestChapter")
-            book_url = details.get("url") or details.get("bookUrl") or book_url
-    except Exception:
-        pass
+    """Build one search hit from a pasted book URL (searchDisabled / URL-only sources).
+
+    Requires a successful getDetails — never invent a path-id stub (e.g. title=83216).
+    """
+    details = run_details(source, book_url, "")
+    if not isinstance(details, dict):
+        return []
+    title = (details.get("title") or details.get("bookTitle") or "").strip()
     if not title:
-        path = urlparse(book_url).path.rstrip("/")
-        title = path.rsplit("/", 1)[-1].split(".htm")[0] or book_url
+        return []
+    author = (details.get("author") or details.get("bookAuthor") or "").strip()
+    cover = details.get("cover") or details.get("bookCover")
+    latest = details.get("latestChapter")
+    book_url = details.get("url") or details.get("bookUrl") or book_url
     return [{
         "bookTitle": title,
         "bookUrl": book_url,
@@ -1583,7 +1579,7 @@ _SOURCE = json.loads(r"""{
   "insecure": false,
   "searchDisabled": true,
   "tocDesc": true,
-  "tocUrlTemplate": "https://69shuba.com/book/%s/",
+  "tocUrlTemplate": "https://www.69shuba.com/book/%s/",
   "bookUrlRegex": "https://(?:www\\.)?69shuba\\.com/book/(.*?)\\.htm",
   "search": {
     "url": "https://69shuba.com/modules/article/search.php",

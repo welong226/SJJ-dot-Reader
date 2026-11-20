@@ -38,6 +38,7 @@ class SearchViewModelUrlTest {
 
     @Test
     fun bookTitleFromUrlUsesPathSegment() {
+        // Helper retained for logging/diagnostics; searchUrl must not show this as a stub hit.
         assertEquals(
             "12345",
             SearchViewModel.bookTitleFromUrl("https://www.69shuba.com/book/12345.htm"),
