@@ -65,4 +65,16 @@ class CloudflareChallengeDetectorTest {
         assertFalse(CloudflareChallengeDetector.hasClearanceCookie(null))
         assertFalse(CloudflareChallengeDetector.hasClearanceCookie("cf_clearance="))
     }
+
+    @Test
+    fun ignoresGenericCloudflareForbiddenWithoutChallengeBody() {
+        // Must not open WebView for every CF-fronted 403 (would blank/spam verification).
+        assertFalse(
+            CloudflareChallengeDetector.isChallenge(
+                403,
+                mapOf("server" to "cloudflare"),
+                "<html><body>Forbidden</body></html>",
+            )
+        )
+    }
 }

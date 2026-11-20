@@ -30,6 +30,8 @@ object CloudflareCookieBridge {
     /** Default reuse window when CookieManager does not expose Max-Age (cf_clearance often ~30m). */
     private val DEFAULT_TTL_MS = TimeUnit.MINUTES.toMillis(25)
 
+    private val CF_COOKIE_PREFIXES = arrayOf("cf_clearance", "cf_chl", "__cf_bm", "cf_chl_rc")
+
     private val cache = ConcurrentHashMap<String, Credentials>()
     private val hostLocks = ConcurrentHashMap<String, Any>()
 
@@ -66,7 +68,8 @@ object CloudflareCookieBridge {
     }
 
     /**
-     * Reads [CookieManager] for [url] without showing UI. Updates cache when clearance is found.
+     * Reads [CookieManager] for [url] (and www / bare twin) without showing UI.
+     * Updates cache when clearance is found.
      *
      * @param preferredUserAgent UA to associate with cookies (must match later Python requests).
      */
@@ -74,7 +77,7 @@ object CloudflareCookieBridge {
     @JvmOverloads
     fun refreshFromCookieManager(url: String, preferredUserAgent: String? = null): Map<String, String>? {
         val host = hostOf(url) ?: return null
-        val cookie = safeGetCookie(url) ?: return null
+        val cookie = mergeCookiesForHost(url) ?: return null
         if (!CloudflareChallengeDetector.hasClearanceCookie(cookie)) {
             return null
         }
@@ -86,6 +89,8 @@ object CloudflareCookieBridge {
             host = host,
         )
         cache[host] = creds
+        // Mirror cache under the twin host (www ↔ bare) so either form reuses clearance.
+        twinHost(host)?.let { twin -> cache.putIfAbsent(twin, creds.copy(host = twin)) }
         Log.i("CloudflareCookieBridge refreshed cookies for $host")
         return creds.toMap()
     }
@@ -110,10 +115,15 @@ object CloudflareCookieBridge {
         synchronized(lock) {
             if (!forceSolve) {
                 getCachedCredentials(url)?.let { return it }
+                twinHost(host)?.let { getCachedCredentials("https://$it/") }?.let { return it }
                 val uaHint = headerIgnoreCase(headers, "User-Agent")
                 refreshFromCookieManager(url, uaHint)?.let { return it }
             } else {
                 cache.remove(host)
+                twinHost(host)?.let { cache.remove(it) }
+                // Drop stale clearance from the in-app browser so autoCfClearance waits for a
+                // fresh cookie earned with this WebView UA (avoids blank instant-close).
+                clearClearanceCookies(url)
             }
             return solveViaWebView(url, headers ?: emptyMap())
         }
@@ -124,6 +134,7 @@ object CloudflareCookieBridge {
     fun clearHost(hostOrUrl: String) {
         val host = hostOf(hostOrUrl) ?: hostOrUrl.lowercase()
         cache.remove(host)
+        twinHost(host)?.let { cache.remove(it) }
         Log.i("CloudflareCookieBridge cleared cache for $host")
     }
 
@@ -140,19 +151,74 @@ object CloudflareCookieBridge {
         return CloudflareChallengeDetector.isChallenge(statusCode, headers, bodySnippet)
     }
 
+    /**
+     * Expire CF clearance / challenge cookies for [url]'s host and www/bare twin.
+     * Safe to call off the main thread (posts CookieManager work to main when needed).
+     */
+    @JvmStatic
+    fun clearClearanceCookies(url: String) {
+        val origins = cookieOrigins(url)
+        if (origins.isEmpty()) return
+        val work = Runnable {
+            try {
+                val cm = CookieManager.getInstance()
+                for (origin in origins) {
+                    val existing = cm.getCookie(origin) ?: continue
+                    for (part in existing.split(';')) {
+                        val name = part.substringBefore('=', missingDelimiterValue = "").trim()
+                        if (name.isEmpty()) continue
+                        if (CF_COOKIE_PREFIXES.any { name.equals(it, true) || name.startsWith(it) }) {
+                            cm.setCookie(origin, "$name=; Max-Age=0; Path=/")
+                        }
+                    }
+                }
+                cm.flush()
+            } catch (e: Exception) {
+                Log.e("CloudflareCookieBridge clearClearanceCookies failed", e)
+            }
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            work.run()
+        } else {
+            val latch = java.util.concurrent.CountDownLatch(1)
+            Handler(Looper.getMainLooper()).post {
+                try {
+                    work.run()
+                } finally {
+                    latch.countDown()
+                }
+            }
+            latch.await(3, TimeUnit.SECONDS)
+        }
+    }
+
     private fun solveViaWebView(url: String, headers: Map<String, String>): Map<String, String>? {
         ScriptTaskRegistry.throwIfCurrentCancelled()
         val host = hostOf(url) ?: return null
-        val ua = headerIgnoreCase(headers, "User-Agent") ?: defaultWebViewUserAgent()
-        val webHeaders = HashMap(headers)
+        // Prefer system/WebView UA for solving — source UAs often mismatch WebView chrome and
+        // cause blank CF pages. Store the UA that actually earned clearance for Python retry.
+        val requestedUa = headerIgnoreCase(headers, "User-Agent")
+        val ua = defaultWebViewUserAgent()
+        val webHeaders = HashMap<String, String>()
+        // Keep Accept-Language etc. if present, but force the WebView UA.
+        headers.forEach { (k, v) ->
+            if (!k.equals("User-Agent", ignoreCase = true) && !k.equals("Cookie", ignoreCase = true)) {
+                webHeaders[k] = v
+            }
+        }
         webHeaders["User-Agent"] = ua
+        if (requestedUa != null && requestedUa != ua) {
+            Log.i("CloudflareCookieBridge using WebView UA instead of source UA for CF solve")
+        }
 
-        Log.i("CloudflareCookieBridge opening WebView for CF challenge: $url")
+        // Challenge interstitial is zone-scoped; loading site origin avoids deep-link quirks
+        // (www redirects, book pages that embed differently). Fall back to original url.
+        val challengeUrl = challengeEntryUrl(url)
+
+        Log.i("CloudflareCookieBridge opening WebView for CF challenge: $challengeUrl (from $url)")
         try {
-            // verificationKey empty + autoCfClearance: activity finishes when cf_clearance appears,
-            // or when the user taps 完成 after an interactive Turnstile.
             WebViewVerificationActivity.startAndWaitResult(
-                url = url,
+                url = challengeUrl,
                 headerMap = webHeaders,
                 verificationKey = "",
                 autoCfClearance = true,
@@ -163,10 +229,9 @@ object CloudflareCookieBridge {
             Log.e("CloudflareCookieBridge WebView solve failed for $host", e)
         }
 
-        // Persist cookies from WebView immediately.
         flushCookies()
 
-        val cookie = safeGetCookie(url)
+        val cookie = mergeCookiesForHost(url) ?: mergeCookiesForHost(challengeUrl)
         if (cookie.isNullOrBlank() || !CloudflareChallengeDetector.hasClearanceCookie(cookie)) {
             Log.e("CloudflareCookieBridge no cf_clearance after WebView for $host")
             return null
@@ -178,14 +243,64 @@ object CloudflareCookieBridge {
             host = host,
         )
         cache[host] = creds
+        twinHost(host)?.let { twin -> cache[twin] = creds.copy(host = twin) }
         Log.i("CloudflareCookieBridge solved CF for $host")
         return creds.toMap()
+    }
+
+    /** Prefer https://host/ for the interstitial; keep path for non-http(s) edge cases. */
+    private fun challengeEntryUrl(url: String): String {
+        return try {
+            val uri = URI(url)
+            val host = uri.host ?: return url
+            val scheme = (uri.scheme ?: "https").lowercase()
+            if (scheme != "http" && scheme != "https") return url
+            "$scheme://$host/"
+        } catch (_: Exception) {
+            url
+        }
+    }
+
+    private fun mergeCookiesForHost(url: String): String? {
+        val merged = LinkedHashMap<String, String>()
+        for (origin in cookieOrigins(url)) {
+            val raw = safeGetCookie(origin) ?: continue
+            for (part in raw.split(';')) {
+                val trimmed = part.trim()
+                if (trimmed.isEmpty() || '=' !in trimmed) continue
+                val name = trimmed.substringBefore('=').trim()
+                val value = trimmed.substringAfter('=').trim()
+                if (name.isNotEmpty()) merged[name] = value
+            }
+        }
+        if (merged.isEmpty()) return null
+        return merged.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
+    private fun cookieOrigins(url: String): List<String> {
+        val host = hostOf(url) ?: return emptyList()
+        val origins = LinkedHashSet<String>()
+        origins.add(url)
+        origins.add("https://$host/")
+        origins.add("http://$host/")
+        twinHost(host)?.let { twin ->
+            origins.add("https://$twin/")
+            origins.add("http://$twin/")
+        }
+        return origins.toList()
+    }
+
+    private fun twinHost(host: String): String? {
+        return when {
+            host.startsWith("www.") && host.length > 4 -> host.removePrefix("www.")
+            '.' in host -> "www.$host"
+            else -> null
+        }
     }
 
     private fun flushCookies() {
         try {
             val cm = CookieManager.getInstance()
-            // flush is async on older APIs; post to main and briefly yield
             if (Looper.myLooper() == Looper.getMainLooper()) {
                 cm.flush()
             } else {
@@ -214,8 +329,7 @@ object CloudflareCookieBridge {
     }
 
     private fun defaultWebViewUserAgent(): String {
-        // Prefer app desktop UA setting; otherwise a stable Chrome desktop string so
-        // Python requests match the WebView that earned cf_clearance.
+        // Match the WebView that will earn cf_clearance (desktop mode if user enabled it).
         webUserAgent()?.let { return it }
         return try {
             WebSettings.getDefaultUserAgent(App.app)
