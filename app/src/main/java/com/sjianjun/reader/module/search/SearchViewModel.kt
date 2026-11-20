@@ -121,40 +121,53 @@ class SearchViewModel : ViewModel() {
     }
 
     suspend fun searchUrl(url: String): Flow<List<List<SearchResult>>> = withIo {
+        val bookUrl = extractHttpUrl(url) ?: url.trim()
         val allJavaScript = getAllEnableBookSource()
         if (allJavaScript.isEmpty()) {
             toast("无可用书源，请导入书源")
             return@withIo emptyFlow<List<List<SearchResult>>>()
         }
-        val supportSources = allJavaScript.filter { it.isSupported(url) }
-        Log.i("支持的书源数量：${supportSources.size}，url:$url")
+        val supportSources = allJavaScript.filter { it.isSupported(bookUrl) }
+        Log.i("支持的书源数量：${supportSources.size}，url:$bookUrl")
         if (supportSources.isEmpty()) {
             toast("不支持该网站")
             return@withIo emptyFlow<List<List<SearchResult>>>()
         }
 
-        val books = supportSources.map {
+        val books = supportSources.map { source ->
             async<SearchResult?> {
                 try {
-                    val book = it.getDetails(url)!!
-                    val searchResult = SearchResult()
-                    searchResult.bookSource = it
-                    searchResult.bookTitle = book.title
-                    searchResult.bookAuthor = book.author
-                    searchResult.bookCover = book.cover
-                    searchResult.bookUrl = book.url
-                    searchResult
+                    val book = source.getDetails(bookUrl)!!
+                    SearchResult().also {
+                        it.bookSource = source
+                        it.bookTitle = book.title
+                        it.bookAuthor = book.author
+                        it.bookCover = book.cover
+                        it.bookUrl = book.url.ifBlank { bookUrl }
+                    }
                 } catch (e: Exception) {
-                    if (it.lauanage == BookSource.Language.yuedu && !yueduUnsupportedTipShown) {
+                    if (source.lauanage == BookSource.Language.yuedu && !yueduUnsupportedTipShown) {
                         yueduUnsupportedTipShown = true
                         toast(BookSource.YUEDU_UNSUPPORTED)
                     }
-                    Log.e("获取书籍详情失败 ${it.name} url:$url", e)
-                    null
+                    Log.e("获取书籍详情失败 ${source.name} url:$bookUrl", e)
+                    // Still return a clickable hit so URL paste is never a silent no-op
+                    // (searchDisabled sources / CF failures previously showed empty with no toast).
+                    SearchResult().also {
+                        it.bookSource = source
+                        it.bookTitle = bookTitleFromUrl(bookUrl)
+                        it.bookUrl = bookUrl
+                        it.bookAuthor = source.name
+                        it.latestChapter = "详情待加载"
+                    }
                 }
             }
         }
         val results = books.awaitAll().filterNotNull()
+        if (results.isEmpty()) {
+            toast("链接导入失败")
+            return@withIo flowOf(emptyList())
+        }
         val group = mutableMapOf<String, MutableList<SearchResult>>()
         val seen = HashSet<String>()
         results.forEach { result -> addSearchResult(group, seen, result) }
@@ -192,14 +205,19 @@ class SearchViewModel : ViewModel() {
 
     /**
      * 搜索书籍。搜索结果插入数据库。由数据库更新。
+     *
+     * http(s) book URLs (including searchDisabled / CF URL-only sources) go through [searchUrl]
+     * → [BookSource.getDetails] instead of keyword [BookSource.search].
      */
     suspend fun search(query: String): Flow<List<List<SearchResult>>> {
-        //是否是URL
-        if (query.startsWith("http")) {
-            return searchUrl(query)
+        val bookUrl = extractHttpUrl(query)
+        if (bookUrl != null) {
+            Log.i("search treated as book URL: $bookUrl")
+            return searchUrl(bookUrl)
         }
+        val keyword = query.trim()
         return withIo {
-            searchHistoryDao.insertSearchHistory(SearchHistory(query = query))
+            searchHistoryDao.insertSearchHistory(SearchHistory(query = keyword))
             //读取所有脚本。只读取一次，不接受后续更新
             val allJavaScript = getAllEnableBookSource()
             if (allJavaScript.isEmpty()) {
@@ -215,7 +233,7 @@ class SearchViewModel : ViewModel() {
                     try {
                         Log.i("search ${it.id} start")
                         //同一书源只保留最后一次搜索（py 内部按书源生成标识，不区分关键词）
-                        val search = it.search(query)
+                        val search = it.search(keyword)
                         if (search != null) {
                             emit(search)
                             Log.i("search ${it.id} resultNum:${search.size}")
@@ -232,8 +250,8 @@ class SearchViewModel : ViewModel() {
                 //数据分组返回
                 it.forEach { result -> addSearchResult(group, seen, result) }
                 group.values.sortedWith { a, b ->
-                    val aEq = a.first().bookTitle == query
-                    val bEq = b.first().bookTitle == query
+                    val aEq = a.first().bookTitle == keyword
+                    val bEq = b.first().bookTitle == keyword
                     if (aEq || bEq) {
                         when {
                             aEq && bEq -> return@sortedWith 0
@@ -241,8 +259,8 @@ class SearchViewModel : ViewModel() {
                             bEq -> return@sortedWith 1
                         }
                     }
-                    val aContains = a.first().bookTitle.contains(query, true)
-                    val bContains = b.first().bookTitle.contains(query, true)
+                    val aContains = a.first().bookTitle.contains(keyword, true)
+                    val bContains = b.first().bookTitle.contains(keyword, true)
                     if (aContains || bContains) {
                         when {
                             aContains && bContains -> b.size.compareTo(a.size)
@@ -253,6 +271,39 @@ class SearchViewModel : ViewModel() {
                     b.size.compareTo(a.size)
                 }
             }.flowIo()
+        }
+    }
+
+    companion object {
+        private val HTTP_URL_REGEX =
+            Regex("""(?i)https?://[^\s<>"'，。；、】】）)\]]+""")
+
+        /**
+         * Extract a book/detail http(s) URL from a search query.
+         * Handles leading/trailing whitespace, quotes, and pasted text that contains a URL.
+         */
+        fun extractHttpUrl(query: String): String? {
+            var trimmed = query.trim()
+            val quoteChars = "\"'“”‘’「」"
+            while (trimmed.isNotEmpty() && trimmed.first() in quoteChars) {
+                trimmed = trimmed.drop(1).trimStart()
+            }
+            while (trimmed.isNotEmpty() && trimmed.last() in quoteChars) {
+                trimmed = trimmed.dropLast(1).trimEnd()
+            }
+            if (trimmed.isEmpty()) return null
+            val candidate = HTTP_URL_REGEX.find(trimmed)?.value ?: return null
+            // Trim common trailing punctuation accidentally copied with the link.
+            val trail = ".,;)]}，。；"
+            return candidate.trimEnd { it in trail }
+        }
+
+        fun bookTitleFromUrl(url: String): String {
+            val path = url.toHttpUrlOrNull()?.encodedPath?.trim('/') ?: return url
+            val last = path.substringAfterLast('/')
+                .substringBefore(".htm")
+                .substringBefore(".html")
+            return last.ifBlank { url }
         }
     }
 

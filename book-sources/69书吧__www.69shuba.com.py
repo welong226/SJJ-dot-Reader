@@ -1483,7 +1483,61 @@ def run_content(source, url):
     return "\n".join(parts).strip()
 
 
+def _query_as_book_url(source, query):
+    """If query is a book detail URL for this source, return the cleaned URL; else None."""
+    q = (query or "").strip().strip("\"'“”‘’")
+    m = re.search(r"https?://[^\s<>\"'，。；]+", q, flags=re.I)
+    if not m:
+        return None
+    book_url = m.group(0).rstrip(".,;)]}>，。；")
+    regex = source.get("bookUrlRegex")
+    if regex:
+        try:
+            if re.search(regex, book_url):
+                return book_url
+        except re.error:
+            pass
+    site = source.get("site") or source.get("bookSourceUrl") or ""
+    site_host = (urlparse(site).hostname or "").lower().lstrip("www.")
+    url_host = (urlparse(book_url).hostname or "").lower().lstrip("www.")
+    if site_host and url_host and site_host == url_host:
+        return book_url
+    return None
+
+
+def _search_hit_from_book_url(source, book_url):
+    """Build one search hit from a pasted book URL (searchDisabled / URL-only sources)."""
+    title = ""
+    author = ""
+    cover = None
+    latest = None
+    try:
+        details = run_details(source, book_url, "")
+        if isinstance(details, dict):
+            title = (details.get("title") or details.get("bookTitle") or "").strip()
+            author = (details.get("author") or details.get("bookAuthor") or "").strip()
+            cover = details.get("cover") or details.get("bookCover")
+            latest = details.get("latestChapter")
+            book_url = details.get("url") or details.get("bookUrl") or book_url
+    except Exception:
+        pass
+    if not title:
+        path = urlparse(book_url).path.rstrip("/")
+        title = path.rsplit("/", 1)[-1].split(".htm")[0] or book_url
+    return [{
+        "bookTitle": title,
+        "bookUrl": book_url,
+        "bookAuthor": author,
+        "bookCover": cover,
+        "latestChapter": latest,
+    }]
+
+
 def run_search(source, query):
+    # URL paste must work even when keyword search is disabled (CF / URL-only sources).
+    book_url = _query_as_book_url(source, query)
+    if book_url:
+        return _search_hit_from_book_url(source, book_url)
     if source.get("searchDisabled"):
         return []
     if not (source.get("search") or {}).get("url"):
@@ -1567,7 +1621,10 @@ def getSiteUrl():
 
 
 def search(query):
-    """按 ruleSearch 搜索，只请求第一页。searchDisabled 时返回空列表。"""
+    """按 ruleSearch 搜索，只请求第一页。
+
+    searchDisabled 时关键词搜索返回空列表，但粘贴的书籍详情 URL 仍返回一条结果。
+    """
     return run_search(_SOURCE, query)
 
 
