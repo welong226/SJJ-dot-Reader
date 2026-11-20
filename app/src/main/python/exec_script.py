@@ -4,6 +4,7 @@ import json
 import socket
 import threading
 import time
+from urllib.parse import urlencode, urlparse
 
 # ==================== 可取消的脚本任务 ====================
 # Java 侧每次脚本调用前会分配一个任务标识（set_current_task / clear_current_task）。
@@ -305,8 +306,238 @@ def _install_dns_hook():
         pass
 
 
+# ==================== Cloudflare 透明降级：requests 被挡时改走 WebView ====================
+# 目标：书源一行都不用改。requests 拿到 Cloudflare 验证页时，自动用后台 WebView
+# （真浏览器，会跑 JS）重抓一次，把回来的 HTML 包成 requests.Response 还给书源。
+# 触发条件：HTTP 403/503 + 页面像 Cloudflare 验证页，或 403/503 + 响应头带 cf-ray
+# 且 Content-Type 是 HTML（JSON 接口的 403 不触发，避免把 JSON 包成 HTML）。
+# 另外两个优化：
+#   1) 某域名经 WebView 成功一次后记下来（_CF_WEBVIEW_HOSTS，默认 30 分钟），
+#      其间同域名请求直接走 WebView，不再先浪费一次被挡的 requests；
+#   2) WebView 过关后，把全局 CookieManager 里的 cookie（主要是 cf_clearance）
+#      同步进当前 Session，之后同站 requests 直接过，不用再开 WebView。
+# 限制：web_get 只回 HTML（GET；POST 用 web_post），响应头/状态码是合成的；
+# WebView 抓一次要几秒，只对被挡的站用；遇到要人手点的验证框时 WebView 也过不了，
+# 那时应由书源改调 verification_activity_get（弹可见 WebView 让人点一次），本层不自动弹。
+
+_CF_CHALLENGE_MARKERS = (
+    "just a moment", "cf-challenge", "checking your browser",
+    "attention required", "turnstile", "challenge-platform",
+    "请稍候", "正在检查",
+)
+_CF_WEBVIEW_HOST_TTL = 30 * 60  # 秒：某域名经 WebView 成功后，直接走 WebView 的有效期
+_CF_WEBVIEW_TIMEOUT = 30  # 秒：单次 WebView 抓取超时
+_CF_WEBVIEW_HOSTS = {}  # host -> expiry timestamp
+_CF_WEBVIEW_HOSTS_LOCK = threading.Lock()
+
+
+def _log_cf(msg):
+    """降级日志：能打到 App 日志就打，打不出就静默（绝不能影响请求本身）。"""
+    try:
+        from log import log
+        log("[cf-fallback] " + msg)
+    except Exception:
+        pass
+
+
+def _html_has_cf_markers(html):
+    try:
+        text = (html or "")[:65536].lower()
+    except Exception:
+        return False
+    return any(m in text for m in _CF_CHALLENGE_MARKERS)
+
+
+def _looks_like_cf_challenge(resp):
+    """响应是否像 Cloudflare 验证页。"""
+    if resp is None:
+        return False
+    try:
+        status = resp.status_code
+    except Exception:
+        return False
+    if status not in (403, 503):
+        return False
+    try:
+        body = resp.text or ""
+    except Exception:
+        body = ""
+    if _html_has_cf_markers(body):
+        return True
+    # 无明显标记时：只有 Cloudflare 前置 + 返回 HTML 才值得试一次 WebView，
+    # JSON 接口的 403（例如鉴权失败）不触发，避免把 JSON 包成 HTML。
+    try:
+        headers = {k.lower(): v for k, v in (resp.headers or {}).items()}
+    except Exception:
+        headers = {}
+    content_type = headers.get("content-type", "")
+    return "cf-ray" in headers and "text/html" in content_type
+
+
+def _url_host(url):
+    try:
+        return urlparse(url or "").hostname or ""
+    except Exception:
+        return ""
+
+
+def _webview_host_remembered(host):
+    if not host:
+        return False
+    now = time.time()
+    with _CF_WEBVIEW_HOSTS_LOCK:
+        expiry = _CF_WEBVIEW_HOSTS.get(host)
+        if expiry is None:
+            return False
+        if now > expiry:
+            del _CF_WEBVIEW_HOSTS[host]
+            return False
+        return True
+
+
+def _webview_host_remember(host, ttl=_CF_WEBVIEW_HOST_TTL):
+    if not host:
+        return
+    with _CF_WEBVIEW_HOSTS_LOCK:
+        _CF_WEBVIEW_HOSTS[host] = time.time() + ttl
+
+
+def _webview_host_forget(host):
+    if not host:
+        return
+    with _CF_WEBVIEW_HOSTS_LOCK:
+        _CF_WEBVIEW_HOSTS.pop(host, None)
+
+
+def _webview_fetch(method, url, headers, data=None, timeout=_CF_WEBVIEW_TIMEOUT):
+    """经后台 WebView 抓一页，返回 (final_url, html)；失败返回 (None, None)。
+
+    web_get/web_post 返回的是 JSON 字符串 {"url": ..., "html": ...}。
+    懒加载 import，避免与 WebViewClient.py 的循环引用（它 import exec_script）。
+    """
+    try:
+        from WebViewClient import web_get, web_post
+        if method == "POST":
+            raw = web_post(url, data or "", timeout=int(timeout * 1000))
+        else:
+            raw = web_get(url, headers or {}, timeout=int(timeout * 1000))
+        if not raw:
+            return None, None
+        parsed = json.loads(raw)
+        html = parsed.get("html") or ""
+        if not html:
+            return None, None
+        return parsed.get("url") or url, html
+    except Exception:
+        return None, None
+
+
+def _sync_webview_cookies(session, url):
+    """把 WebView 全局 CookieManager 里的 cookie 同步进 Session；返回同步的条数。
+
+    WebView 过关后 Cloudflare 会下 cf_clearance 等 cookie，全局 CookieManager 会保留
+    它们（见 WebViewVerificationActivity 的注释）。同步后同站 requests 可能直接过。
+    失败就静默跳过：这只是优化，降级本身不靠它。
+    """
+    try:
+        from android.webkit import CookieManager
+        raw = CookieManager.getInstance().getCookie(url)
+        if not raw:
+            return 0
+        host = _url_host(url)
+        count = 0
+        for part in raw.split(";"):
+            part = part.strip()
+            if "=" not in part:
+                continue
+            name, value = part.split("=", 1)
+            name, value = name.strip(), value.strip()
+            if not name:
+                continue
+            try:
+                session.cookies.set(name, value, domain=host)
+                count += 1
+            except Exception:
+                pass
+        return count
+    except Exception:
+        return 0
+
+
+def _synth_response(url, final_url, html, orig_resp=None):
+    """把 WebView 抓回的 HTML 包成 requests.Response（状态码/响应头是合成的）。"""
+    import requests
+    synth = requests.Response()
+    synth.status_code = 200
+    synth._content = html.encode("utf-8", "ignore")
+    synth.headers["Content-Type"] = "text/html; charset=utf-8"
+    synth.url = final_url or url
+    synth.reason = "OK"
+    synth.encoding = "utf-8"
+    if orig_resp is not None:
+        try:
+            synth.request = orig_resp.request
+        except Exception:
+            pass
+    return synth
+
+
+def _try_webview(session, method, url, kwargs, orig_resp=None):
+    """经 WebView 抓一页并包成 Response；失败返回 None（调用方回落到原始响应）。"""
+    if not url:
+        return None
+    try:
+        headers = dict(kwargs.get("headers") or {})
+    except Exception:
+        headers = {}
+    data = None
+    if method == "POST":
+        data = kwargs.get("data")
+        if data is None and kwargs.get("json") is not None:
+            try:
+                data = json.dumps(kwargs.get("json"), ensure_ascii=False)
+            except Exception:
+                data = None
+        elif isinstance(data, dict):
+            try:
+                data = urlencode(data)
+            except Exception:
+                data = None
+        elif isinstance(data, (bytes, bytearray)):
+            data = bytes(data).decode("utf-8", "ignore")
+        elif data is not None:
+            data = str(data)
+    final_url, html = _webview_fetch(method, url, headers, data=data)
+    if not html:
+        return None
+    if _html_has_cf_markers(html):
+        # WebView 也拿到了验证页（例如要人手点的 Turnstile）：不记域名、不伪装成功。
+        # 这种情况应由书源改调 verification_activity_get（弹可见 WebView 让人点一次）。
+        _log_cf("WebView 仍被验证拦截：%s" % url)
+        return None
+    host = _url_host(url)
+    _webview_host_remember(host)
+    try:
+        synced = _sync_webview_cookies(session, final_url or url)
+    except Exception:
+        synced = 0
+    _log_cf("Cloudflare 降级：WebView 已代取 %s（同步 cookie %d 条）" % (url, synced))
+    return _synth_response(url, final_url, html, orig_resp)
+
+
+def _requests_call_info(args, kwargs):
+    """从 Session.request 的调用参数里取出 (method, url)，兼容位置参数与关键字参数。"""
+    method = kwargs.get("method", args[0] if len(args) > 0 else "GET")
+    url = kwargs.get("url", args[1] if len(args) > 1 else "")
+    return str(method or "GET").upper(), url or ""
+
+
 def _install_requests_hooks():
-    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时。"""
+    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时。
+
+    另加 Cloudflare 透明降级：响应像验证页时自动改走 WebView 重抓（见上节），
+    命中时书源无感知；降级本身任何一步失败都退回原始响应，不把请求搞砸。
+    """
     try:
         import requests
         if getattr(requests.Session.request, "_liter_reader_patched", False):
@@ -319,12 +550,34 @@ def _install_requests_hooks():
             # 建连超时设短一点，DNS/握手卡住时能快速失败，脚本好重试或降级）
             if "timeout" not in kwargs and len(args) < 9:
                 kwargs["timeout"] = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+            method, url = _requests_call_info(args, kwargs)
+            host = _url_host(url)
+            # 1) 该域名最近经 WebView 成功过：直接走 WebView，省一次被挡的尝试
+            if host and _webview_host_remembered(host):
+                synth = _try_webview(self, method, url, kwargs)
+                if synth is not None:
+                    return synth
+                # WebView 失败：回落到正常 requests，并清除记忆，避免每次都先卡 WebView
+                _webview_host_forget(host)
+            # 2) 正常 requests
             try:
-                return orig_request(self, *args, **kwargs)
+                resp = orig_request(self, *args, **kwargs)
             except BaseException:
                 if _is_aborted(key):
                     raise ScriptAborted("脚本任务已取消")
                 raise
+            # 3) 命中 Cloudflare 验证页：改走 WebView 重抓
+            try:
+                if _looks_like_cf_challenge(resp):
+                    synth = _try_webview(self, method, url, kwargs, resp)
+                    if synth is not None:
+                        return synth
+            except BaseException:
+                if _is_aborted(key):
+                    raise ScriptAborted("脚本任务已取消")
+                # 降级失败：退回原始响应
+                pass
+            return resp
 
         requests.Session.request = _mark_patched(request)
     except Exception:
