@@ -4,6 +4,10 @@ package com.sjianjun.reader.http
  * Detects Cloudflare challenge / interstitial pages from HTTP status, headers, and HTML snippets.
  * Used by the Python requests hook (via [CloudflareCookieBridge]) so book sources do not need
  * per-site CF handling.
+ *
+ * 69shuba and similar sites often return 403 with `cf-mitigated: challenge`, `Server: cloudflare`,
+ * and a "Just a moment..." body. Bare 403s that still carry CF signals must open the WebView —
+ * waiting for rich HTML alone previously let [raise_for_status] fail the user with no UI.
  */
 object CloudflareChallengeDetector {
 
@@ -24,6 +28,8 @@ object CloudflareChallengeDetector {
         "turnstile",
         "challenge-error-title",
         "challenge-error-text",
+        "cdn-cgi/challenge",
+        "challenges.cloudflare.com",
     )
 
     /**
@@ -43,11 +49,16 @@ object CloudflareChallengeDetector {
         val bodyLooksLikeChallenge = BODY_MARKERS.any { body.contains(it, ignoreCase = true) }
         val server = headerMap["server"].orEmpty()
         val looksLikeCfServer = SERVER_MARKERS.any { server.contains(it, ignoreCase = true) }
+        val hasCfRay = !headerMap["cf-ray"].isNullOrBlank()
+        val looksLikeCf = looksLikeCfServer || hasCfRay ||
+            headerMap.containsKey("cf-mitigated") ||
+            headerMap.keys.any { it.startsWith("cf-") }
 
-        // 403/503 + challenge HTML (or CF server + strong interstitial markers).
-        // Do not treat every Cloudflare-fronted 403 as a challenge — that would spam WebView.
-        if (statusCode in CHALLENGE_STATUS_CODES && bodyLooksLikeChallenge) {
-            return true
+        // Official / classic challenge pages: 403/503 with CF signals and/or challenge HTML.
+        if (statusCode in CHALLENGE_STATUS_CODES) {
+            if (bodyLooksLikeChallenge) return true
+            // Bare 403/503 from Cloudflare (headers only, empty/opaque body) — still open WebView.
+            if (looksLikeCf) return true
         }
 
         // Some CF setups return 200 with an interstitial; require strong body markers.
@@ -55,7 +66,8 @@ object CloudflareChallengeDetector {
                 body.contains("cf-browser-verification", ignoreCase = true) ||
                     body.contains("_cf_chl_opt", ignoreCase = true) ||
                     body.contains("cdn-cgi/challenge-platform", ignoreCase = true) ||
-                    (looksLikeCfServer && body.contains("just a moment", ignoreCase = true))
+                    body.contains("challenges.cloudflare.com", ignoreCase = true) ||
+                    (looksLikeCf && body.contains("just a moment", ignoreCase = true))
                 )
         ) {
             return true

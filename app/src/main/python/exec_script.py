@@ -377,23 +377,81 @@ def _response_headers_map(response):
         return {}
 
 
-def _is_cf_challenge_response(response):
-    bridge = _cf_bridge()
-    if bridge is None:
-        return False
+def _response_body_snippet(response):
     try:
-        body = ""
+        return (response.text or "")[:_CF_BODY_SNIPPET]
+    except Exception:
         try:
-            # Prefer text for HTML markers; fall back to raw bytes decode.
-            body = (response.text or "")[:_CF_BODY_SNIPPET]
+            return (response.content or b"")[:_CF_BODY_SNIPPET].decode("utf-8", "ignore")
         except Exception:
-            try:
-                body = (response.content or b"")[:_CF_BODY_SNIPPET].decode("utf-8", "ignore")
-            except Exception:
-                body = ""
-        return bool(bridge.isChallenge(int(response.status_code), _response_headers_map(response), body))
+            return ""
+
+
+def _py_is_cf_challenge(status_code, headers, body):
+    """Pure-Python fallback when Kotlin bridge is unavailable or throws.
+
+    Matches bare 403/503 from Cloudflare (cf-mitigated / cf-ray / Server) even without
+    parsing the full challenge HTML — otherwise raise_for_status fails with no WebView.
+    """
+    try:
+        code = int(status_code)
     except Exception:
         return False
+    h = {}
+    for k, v in (headers or {}).items():
+        h[str(k).lower()] = str(v)
+    body = body or ""
+    body_l = body.lower()
+    mitigated = h.get("cf-mitigated", "")
+    if mitigated.lower() == "challenge":
+        return True
+    server = h.get("server", "").lower()
+    has_cf = (
+        "cloudflare" in server
+        or bool(h.get("cf-ray"))
+        or any(k.startswith("cf-") for k in h)
+    )
+    markers = (
+        "just a moment",
+        "cf-browser-verification",
+        "_cf_chl_opt",
+        "cdn-cgi/challenge",
+        "challenges.cloudflare.com",
+        "attention required! | cloudflare",
+        "challenge-platform",
+        "turnstile",
+    )
+    body_hit = any(m in body_l for m in markers)
+    if code in (403, 503):
+        if body_hit or has_cf:
+            return True
+    if body_hit and (
+        "cf-browser-verification" in body_l
+        or "_cf_chl_opt" in body_l
+        or "cdn-cgi/challenge" in body_l
+        or "challenges.cloudflare.com" in body_l
+    ):
+        return True
+    return False
+
+
+def _is_cf_challenge_response(response):
+    headers = _response_headers_map(response)
+    body = _response_body_snippet(response)
+    status = getattr(response, "status_code", 0)
+    bridge = _cf_bridge()
+    if bridge is not None:
+        try:
+            from java.util import HashMap
+            java_headers = HashMap()
+            for key, value in headers.items():
+                java_headers.put(str(key), str(value))
+            if bool(bridge.isChallenge(int(status), java_headers, body)):
+                return True
+        except Exception:
+            # Fall through to pure-Python detection — never swallow as "not a challenge".
+            pass
+    return _py_is_cf_challenge(status, headers, body)
 
 
 def _ensure_cf_credentials(url, headers, force=False):
@@ -465,15 +523,18 @@ def _install_requests_hooks():
                 raise
 
             # One automatic CF solve + retry per request (avoid loops).
+            # Must run *before* script raise_for_status() so 403 CF pages open WebView.
             already = getattr(self, _CF_RETRY_ATTR, False)
             if (not already) and url and _is_cf_challenge_response(response):
                 check_aborted()
+                # Drop stale CookieManager clearance that caused a still-challenged response.
                 solved = _ensure_cf_credentials(url, _header_dict(kwargs), force=True)
                 if solved:
                     try:
                         setattr(self, _CF_RETRY_ATTR, True)
                         retry_kwargs = _apply_cf_credentials(dict(kwargs), solved)
                         response = orig_request(self, *args, **retry_kwargs)
+                        # If retry is still challenged, leave it for the script; user can retry.
                     finally:
                         try:
                             setattr(self, _CF_RETRY_ATTR, False)

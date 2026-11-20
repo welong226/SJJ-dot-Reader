@@ -67,12 +67,30 @@ class CloudflareChallengeDetectorTest {
     }
 
     @Test
-    fun ignoresGenericCloudflareForbiddenWithoutChallengeBody() {
-        // Must not open WebView for every CF-fronted 403 (would blank/spam verification).
+    fun bareCloudflare403OpensChallenge() {
+        // 69shuba-style: CF signals in headers even when body is empty/opaque.
+        assertTrue(
+            CloudflareChallengeDetector.isChallenge(
+                403,
+                mapOf("server" to "cloudflare", "cf-ray" to "abc123-IAD"),
+                "",
+            )
+        )
+        assertTrue(
+            CloudflareChallengeDetector.isChallenge(
+                403,
+                mapOf("Cf-Mitigated" to "challenge", "Server" to "cloudflare"),
+                "<html><title>Just a moment...</title></html>",
+            )
+        )
+    }
+
+    @Test
+    fun ignoresNonCloudflareForbidden() {
         assertFalse(
             CloudflareChallengeDetector.isChallenge(
                 403,
-                mapOf("server" to "cloudflare"),
+                mapOf("server" to "nginx"),
                 "<html><body>Forbidden</body></html>",
             )
         )
