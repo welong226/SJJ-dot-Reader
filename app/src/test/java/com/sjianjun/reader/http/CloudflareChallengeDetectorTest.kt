@@ -113,5 +113,12 @@ class CloudflareChallengeDetectorTest {
                 """.trimIndent(),
             )
         )
+        assertTrue(
+            CloudflareChallengeDetector.isUsableContentHtml(
+                "<html><head><title>撈屍人</title></head><body>" +
+                    ("章节目录 /book/83216/ ".repeat(200)) +
+                    "</body></html>",
+            )
+        )
     }
 }

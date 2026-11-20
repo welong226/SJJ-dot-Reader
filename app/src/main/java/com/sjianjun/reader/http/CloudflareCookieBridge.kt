@@ -258,9 +258,16 @@ object CloudflareCookieBridge {
 
         val cookie = mergeCookiesForHost(url) ?: mergeCookiesForHost(challengeUrl) ?: ""
         val hasClearance = CloudflareChallengeDetector.hasClearanceCookie(cookie)
-        val usableHtml = pageHtml.takeIf { html ->
-            CloudflareChallengeDetector.isUsableContentHtml(html)
-        }.orEmpty()
+        val usableHtml = when {
+            CloudflareChallengeDetector.isUsableContentHtml(pageHtml) -> pageHtml
+            pageHtml.length >= 2_500 &&
+                !CloudflareChallengeDetector.isChallenge(
+                    200,
+                    mapOf("server" to "cloudflare"),
+                    pageHtml.take(8192),
+                ) -> pageHtml
+            else -> ""
+        }
 
         // Prefer usable WebView HTML for getDetails even if clearance is still settling —
         // previously returning null here discarded a fully loaded book page and left search blank.

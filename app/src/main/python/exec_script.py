@@ -544,11 +544,17 @@ def _html_looks_usable_for_details(html):
     if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
         return False
     sample = html
-    if "og:novel:book_name" in sample or "og:novel:author" in sample:
+    lower = sample.lower()
+    if "og:novel:" in lower:
         return True
-    if 'id="catalog"' in sample or "id='catalog'" in sample:
+    if 'id="catalog"' in lower or "id='catalog'" in lower or "id=catalog" in lower:
         return True
-    if len(sample) >= 4000 and "<body" in sample.lower():
+    if "txtnav" in lower:
+        return True
+    title_challenge = "<title>just a moment" in lower or "<title>attention required" in lower
+    if (not title_challenge) and "/book/" in lower and len(sample) >= 2500 and "<body" in lower:
+        return True
+    if (not title_challenge) and len(sample) >= 3000 and "<body" in lower:
         return True
     return False
 

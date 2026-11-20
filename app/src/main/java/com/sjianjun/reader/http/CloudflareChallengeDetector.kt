@@ -94,17 +94,34 @@ object CloudflareChallengeDetector {
     @JvmStatic
     fun isUsableContentHtml(html: String?): Boolean {
         if (html.isNullOrBlank()) return false
-        if (isChallenge(200, mapOf("server" to "cloudflare"), html.take(8192))) {
+        val head = html.take(12_000)
+        if (isChallenge(200, mapOf("server" to "cloudflare"), head)) {
             return false
         }
         val sample = html
-        // Strong book/toc signals used by so-novel / Legado CSS rules.
+        // Strong book/toc signals used by so-novel / Legado CSS rules (69书吧 etc.).
         if (sample.contains("og:novel:book_name", ignoreCase = true)) return true
         if (sample.contains("og:novel:author", ignoreCase = true)) return true
+        if (sample.contains("og:novel:", ignoreCase = true)) return true
         if (sample.contains("id=\"catalog\"", ignoreCase = true)) return true
         if (sample.contains("id='catalog'", ignoreCase = true)) return true
-        // Substantial non-challenge document (homepage / listing after clearance).
-        if (sample.length >= 4_000 && sample.contains("<body", ignoreCase = true)) return true
+        if (sample.contains("id=catalog", ignoreCase = true)) return true
+        if (sample.contains("id=\"catalogs\"", ignoreCase = true)) return true
+        if (Regex("""id\s*=\s*["']?catalog""", RegexOption.IGNORE_CASE).containsMatchIn(sample)) return true
+        if (sample.contains("class=\"txtnav\"", ignoreCase = true)) return true
+        if (sample.contains("class='txtnav'", ignoreCase = true)) return true
+        // Book URL page that clearly left the CF interstitial.
+        val titleIsChallenge = sample.contains("<title>Just a moment", ignoreCase = true) ||
+            sample.contains("<title>Attention Required", ignoreCase = true)
+        if (!titleIsChallenge && sample.contains("/book/", ignoreCase = true) &&
+            sample.length >= 2_500 && sample.contains("<body", ignoreCase = true)
+        ) {
+            return true
+        }
+        // Substantial non-challenge document.
+        if (!titleIsChallenge && sample.length >= 3_000 && sample.contains("<body", ignoreCase = true)) {
+            return true
+        }
         return false
     }
 
