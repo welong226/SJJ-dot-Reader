@@ -305,8 +305,330 @@ def _install_dns_hook():
         pass
 
 
+# Cloudflare WebView bridge: inject cookies/UA at the shared requests layer so book sources
+# keep the same search/getDetails/getChapterContent API without per-site CF code.
+_CF_BODY_SNIPPET = 8192
+_CF_RETRY_ATTR = "_cf_bridge_retried"
+
+
+def _cf_bridge():
+    """Lazy import of Kotlin CloudflareCookieBridge (unavailable in pure-Python unit tests)."""
+    try:
+        from com.sjianjun.reader.http import CloudflareCookieBridge
+        return CloudflareCookieBridge
+    except Exception:
+        return None
+
+
+def _request_url(args, kwargs):
+    if len(args) >= 2:
+        return args[1]
+    return kwargs.get("url")
+
+
+def _header_dict(kwargs):
+    headers = kwargs.get("headers")
+    if headers is None:
+        return {}
+    try:
+        return dict(headers)
+    except Exception:
+        return {}
+
+
+def _apply_cf_credentials(kwargs, creds):
+    """Merge CF cookie + matching User-Agent into the outgoing request kwargs."""
+    if not creds:
+        return kwargs
+    cookie = creds.get("cookie") or ""
+    ua = creds.get("userAgent") or ""
+    headers = _header_dict(kwargs)
+    if ua:
+        # Clearance is bound to the UA that earned it — override any source UA.
+        headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+        headers["User-Agent"] = ua
+    if cookie:
+        existing = ""
+        for k, v in list(headers.items()):
+            if k.lower() == "cookie":
+                existing = v or ""
+                del headers[k]
+                break
+        if existing:
+            # Prefer WebView cookies for names that overlap (cf_clearance etc.).
+            merged = {}
+            for part in (existing + ";" + cookie).split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                merged[name.strip()] = value.strip()
+            cookie = "; ".join("%s=%s" % (n, v) for n, v in merged.items() if n)
+        headers["Cookie"] = cookie
+    kwargs = dict(kwargs)
+    kwargs["headers"] = headers
+    return kwargs
+
+
+def _response_headers_map(response):
+    try:
+        return {str(k): str(v) for k, v in response.headers.items()}
+    except Exception:
+        return {}
+
+
+def _response_body_snippet(response):
+    try:
+        return (response.text or "")[:_CF_BODY_SNIPPET]
+    except Exception:
+        try:
+            return (response.content or b"")[:_CF_BODY_SNIPPET].decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+
+def _py_is_cf_challenge(status_code, headers, body):
+    """Pure-Python fallback when Kotlin bridge is unavailable or throws.
+
+    Matches bare 403/503 from Cloudflare (cf-mitigated / cf-ray / Server) even without
+    parsing the full challenge HTML — otherwise raise_for_status fails with no WebView.
+    """
+    try:
+        code = int(status_code)
+    except Exception:
+        return False
+    h = {}
+    for k, v in (headers or {}).items():
+        h[str(k).lower()] = str(v)
+    body = body or ""
+    body_l = body.lower()
+    mitigated = h.get("cf-mitigated", "")
+    if mitigated.lower() == "challenge":
+        return True
+    server = h.get("server", "").lower()
+    has_cf = (
+        "cloudflare" in server
+        or bool(h.get("cf-ray"))
+        or any(k.startswith("cf-") for k in h)
+    )
+    markers = (
+        "just a moment",
+        "cf-browser-verification",
+        "_cf_chl_opt",
+        "cdn-cgi/challenge",
+        "challenges.cloudflare.com",
+        "attention required! | cloudflare",
+        "challenge-platform",
+        "turnstile",
+    )
+    body_hit = any(m in body_l for m in markers)
+    if code in (403, 503):
+        if body_hit or has_cf:
+            return True
+    if body_hit and (
+        "cf-browser-verification" in body_l
+        or "_cf_chl_opt" in body_l
+        or "cdn-cgi/challenge" in body_l
+        or "challenges.cloudflare.com" in body_l
+    ):
+        return True
+    return False
+
+
+def _is_cf_challenge_response(response):
+    headers = _response_headers_map(response)
+    body = _response_body_snippet(response)
+    status = getattr(response, "status_code", 0)
+    bridge = _cf_bridge()
+    if bridge is not None:
+        try:
+            from java.util import HashMap
+            java_headers = HashMap()
+            for key, value in headers.items():
+                java_headers.put(str(key), str(value))
+            if bool(bridge.isChallenge(int(status), java_headers, body)):
+                return True
+        except Exception:
+            # Fall through to pure-Python detection — never swallow as "not a challenge".
+            pass
+    return _py_is_cf_challenge(status, headers, body)
+
+
+def _ensure_cf_credentials(url, headers, force=False):
+    bridge = _cf_bridge()
+    if bridge is None or not url:
+        return None
+    check_aborted()
+    try:
+        from java.util import HashMap
+        java_headers = HashMap()
+        for key, value in (headers or {}).items():
+            java_headers.put(str(key), str(value))
+        return bridge.ensureCredentials(url, java_headers, force)
+    except ScriptAborted:
+        raise
+    except BaseException as e:
+        if is_cancelled_exception(e):
+            raise ScriptAborted("脚本任务已取消")
+        return None
+
+
+def _prefetch_cf_credentials(url, headers):
+    """Reuse cache / CookieManager without opening WebView."""
+    bridge = _cf_bridge()
+    if bridge is None or not url:
+        return None
+    try:
+        cached = bridge.getCachedCredentials(url)
+        if cached:
+            return cached
+        ua = None
+        for k, v in (headers or {}).items():
+            if str(k).lower() == "user-agent":
+                ua = str(v)
+                break
+        return bridge.refreshFromCookieManager(url, ua)
+    except Exception:
+        return None
+
+
+def _creds_map(creds):
+    """Normalize Chaquopy Map / dict into a plain Python dict of strings."""
+    if not creds:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in dict(creds).items()}
+    except Exception:
+        try:
+            out = {}
+            for k in creds.keySet().toArray() if hasattr(creds, "keySet") else []:
+                out[str(k)] = str(creds.get(k))
+            return out
+        except Exception:
+            return {}
+
+
+def _synthetic_html_response(url, html, encoding="utf-8"):
+    """Build a requests.Response from WebView HTML so sources keep using raise_for_status/.text."""
+    import requests
+    from requests.models import Response
+    text = html if isinstance(html, str) else (html or "")
+    body = text.encode(encoding, errors="replace")
+    resp = Response()
+    resp.status_code = 200
+    resp.reason = "OK"
+    resp.url = url or ""
+    resp.encoding = encoding
+    resp._content = body
+    resp.headers = requests.structures.CaseInsensitiveDict({
+        "Content-Type": "text/html; charset=%s" % encoding,
+        "Content-Length": str(len(body)),
+    })
+    return resp
+
+
+def _normalize_book_path(path):
+    """Normalize /book/123.htm vs /book/123/ for CF HTML reuse checks."""
+    p = (path or "/").rstrip("/")
+    lower = p.lower()
+    for suffix in (".htm", ".html"):
+        if lower.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
+    return p.rstrip("/")
+
+
+def _html_looks_usable_for_details(html):
+    if not html or not str(html).strip():
+        return False
+    if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+        return False
+    sample = html
+    lower = sample.lower()
+    if "og:novel:" in lower:
+        return True
+    if 'id="catalog"' in lower or "id='catalog'" in lower or "id=catalog" in lower:
+        return True
+    if "txtnav" in lower:
+        return True
+    title_challenge = "<title>just a moment" in lower or "<title>attention required" in lower
+    if (not title_challenge) and "/book/" in lower and len(sample) >= 2500 and "<body" in lower:
+        return True
+    if (not title_challenge) and len(sample) >= 3000 and "<body" in lower:
+        return True
+    return False
+
+
+def _html_from_cf_creds(creds, request_url):
+    """Use WebView HTML for this request when it is usable post-challenge content.
+
+    Accept same-host book pages even when path differs only by .htm vs trailing slash.
+    Live solve HTML with book markers is accepted for the challenged request URL.
+    """
+    data = _creds_map(creds)
+    html = data.get("html") or ""
+    if not _html_looks_usable_for_details(html):
+        return None
+    html_url = data.get("htmlUrl") or ""
+    if html_url and request_url:
+        try:
+            from urllib.parse import urlparse
+            a = urlparse(request_url)
+            b = urlparse(html_url)
+            ha = (a.hostname or "").lower().lstrip("www.")
+            hb = (b.hostname or "").lower().lstrip("www.")
+            if not (ha and hb and ha == hb):
+                return None
+            pa = _normalize_book_path(a.path)
+            pb = _normalize_book_path(b.path)
+            if pa == pb:
+                return html
+            # Same host + usable book HTML from the interactive solve for this request:
+            # allow when request path is a prefix/sibling book path (toc vs details).
+            if "/book/" in pa and "/book/" in pb and pa.split("/book/")[-1].split("/")[0] == pb.split("/book/")[-1].split("/")[0]:
+                return html
+            return None
+        except Exception:
+            pass
+    return html
+
+
+def _webview_fetch_html(url, creds):
+    """Headless WebView fetch after CF cookies are in CookieManager (requests TLS often still fails)."""
+    if not url:
+        return None
+    check_aborted()
+    try:
+        from java.util import HashMap
+        from com.sjianjun.reader.http import WebViewClient
+        headers = HashMap()
+        data = _creds_map(creds)
+        ua = data.get("userAgent") or ""
+        if ua:
+            headers.put("User-Agent", ua)
+        raw = WebViewClient.get(url, headers, "document.documentElement.outerHTML", 45000)
+        if not raw:
+            return None
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(payload, dict):
+            html = payload.get("html") or ""
+        else:
+            html = str(payload)
+        if not html.strip():
+            return None
+        if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+            return None
+        return html
+    except ScriptAborted:
+        raise
+    except BaseException as e:
+        if is_cancelled_exception(e):
+            raise ScriptAborted("脚本任务已取消")
+        return None
+
+
 def _install_requests_hooks():
-    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时。"""
+    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时 + CF cookie 桥。"""
     try:
         import requests
         if getattr(requests.Session.request, "_liter_reader_patched", False):
@@ -319,12 +641,58 @@ def _install_requests_hooks():
             # 建连超时设短一点，DNS/握手卡住时能快速失败，脚本好重试或降级）
             if "timeout" not in kwargs and len(args) < 9:
                 kwargs["timeout"] = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+
+            url = _request_url(args, kwargs)
+            headers = _header_dict(kwargs)
+            # Silent reuse: cached host cookies / in-app browser CookieManager.
+            # Do not open WebView here — only after a challenge response.
+            creds = _prefetch_cf_credentials(url, headers)
+            if creds:
+                kwargs = _apply_cf_credentials(kwargs, creds)
+
             try:
-                return orig_request(self, *args, **kwargs)
+                response = orig_request(self, *args, **kwargs)
             except BaseException:
                 if _is_aborted(key):
                     raise ScriptAborted("脚本任务已取消")
                 raise
+
+            # One automatic CF solve + retry per request (avoid loops).
+            # Must run *before* script raise_for_status() so 403 CF pages open WebView.
+            already = getattr(self, _CF_RETRY_ATTR, False)
+            if (not already) and url and _is_cf_challenge_response(response):
+                check_aborted()
+                try:
+                    setattr(self, _CF_RETRY_ATTR, True)
+                    # requests TLS often still 403s with a valid cf_clearance (needProxy sites).
+                    # If CookieManager already has clearance, try headless WebView first —
+                    # do NOT force-clear (that would make the user solve CF again for toc/chapters).
+                    existing = _prefetch_cf_credentials(url, _header_dict(kwargs))
+                    if existing and (_creds_map(existing).get("cookie") or ""):
+                        html = _webview_fetch_html(url, existing)
+                        if html:
+                            return _synthetic_html_response(url, html)
+
+                    # Interactive CF WebView (clears stale clearance, waits for fresh cookie).
+                    solved = _ensure_cf_credentials(url, _header_dict(kwargs), force=True)
+                    if solved:
+                        html = _html_from_cf_creds(solved, url)
+                        if html:
+                            return _synthetic_html_response(
+                                _creds_map(solved).get("htmlUrl") or url, html
+                            )
+                        retry_kwargs = _apply_cf_credentials(dict(kwargs), solved)
+                        response = orig_request(self, *args, **retry_kwargs)
+                        if _is_cf_challenge_response(response):
+                            html = _webview_fetch_html(url, solved)
+                            if html:
+                                return _synthetic_html_response(url, html)
+                finally:
+                    try:
+                        setattr(self, _CF_RETRY_ATTR, False)
+                    except Exception:
+                        pass
+            return response
 
         requests.Session.request = _mark_patched(request)
     except Exception:

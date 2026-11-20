@@ -1430,14 +1430,18 @@ def run_details(source, url, last_chapter_url=""):
     author = eval_rule(info.get("author") or "", node, root, ctx).strip()
     cover = abs_url(eval_rule(info.get("coverUrl") or "", node, root, ctx), final)
     intro = eval_rule(info.get("intro") or "", node, root, ctx).strip()
+    # Prefer chapters already on the book page (#catalog) so a second CF toc fetch
+    # cannot wipe a successful details parse and leave search blank.
+    chapters = _chapters_from(source, doc, root, final, ctx)
     toc_url = ""
     if info.get("tocUrl"):
         toc_url = abs_url(eval_rule(info.get("tocUrl") or "", node, root, ctx), final)
     toc_url = _so_toc_url(source, url, final, toc_url)
-    if toc_url:
-        chapters = _collect_chapters(source, toc_url, ctx)
-    else:
-        chapters = _chapters_from(source, doc, root, final, ctx)
+    if toc_url and not chapters:
+        try:
+            chapters = _collect_chapters(source, toc_url, ctx)
+        except Exception:
+            chapters = _chapters_from(source, doc, root, final, ctx)
     if source.get("tocDesc"):
         chapters = list(reversed(chapters))
     return {
@@ -1483,7 +1487,57 @@ def run_content(source, url):
     return "\n".join(parts).strip()
 
 
+def _query_as_book_url(source, query):
+    """If query is a book detail URL for this source, return the cleaned URL; else None."""
+    q = (query or "").strip().strip("\"'“”‘’")
+    m = re.search(r"https?://[^\s<>\"'，。；]+", q, flags=re.I)
+    if not m:
+        return None
+    book_url = m.group(0).rstrip(".,;)]}>，。；")
+    regex = source.get("bookUrlRegex")
+    if regex:
+        try:
+            if re.search(regex, book_url):
+                return book_url
+        except re.error:
+            pass
+    site = source.get("site") or source.get("bookSourceUrl") or ""
+    site_host = (urlparse(site).hostname or "").lower().lstrip("www.")
+    url_host = (urlparse(book_url).hostname or "").lower().lstrip("www.")
+    if site_host and url_host and site_host == url_host:
+        return book_url
+    return None
+
+
+def _search_hit_from_book_url(source, book_url):
+    """Build one search hit from a pasted book URL (searchDisabled / URL-only sources).
+
+    Requires a successful getDetails — never invent a path-id stub (e.g. title=83216).
+    """
+    details = run_details(source, book_url, "")
+    if not isinstance(details, dict):
+        return []
+    title = (details.get("title") or details.get("bookTitle") or "").strip()
+    if not title:
+        return []
+    author = (details.get("author") or details.get("bookAuthor") or "").strip()
+    cover = details.get("cover") or details.get("bookCover")
+    latest = details.get("latestChapter")
+    book_url = details.get("url") or details.get("bookUrl") or book_url
+    return [{
+        "bookTitle": title,
+        "bookUrl": book_url,
+        "bookAuthor": author,
+        "bookCover": cover,
+        "latestChapter": latest,
+    }]
+
+
 def run_search(source, query):
+    # URL paste must work even when keyword search is disabled (CF / URL-only sources).
+    book_url = _query_as_book_url(source, query)
+    if book_url:
+        return _search_hit_from_book_url(source, book_url)
     if source.get("searchDisabled"):
         return []
     if not (source.get("search") or {}).get("url"):
@@ -1529,7 +1583,7 @@ _SOURCE = json.loads(r"""{
   "insecure": false,
   "searchDisabled": true,
   "tocDesc": true,
-  "tocUrlTemplate": "https://69shuba.com/book/%s/",
+  "tocUrlTemplate": "https://www.69shuba.com/book/%s/",
   "bookUrlRegex": "https://(?:www\\.)?69shuba\\.com/book/(.*?)\\.htm",
   "search": {
     "url": "https://69shuba.com/modules/article/search.php",
@@ -1567,7 +1621,10 @@ def getSiteUrl():
 
 
 def search(query):
-    """按 ruleSearch 搜索，只请求第一页。searchDisabled 时返回空列表。"""
+    """按 ruleSearch 搜索，只请求第一页。
+
+    searchDisabled 时关键词搜索返回空列表，但粘贴的书籍详情 URL 仍返回一条结果。
+    """
     return run_search(_SOURCE, query)
 
 
