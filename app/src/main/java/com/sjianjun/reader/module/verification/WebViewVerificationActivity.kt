@@ -4,6 +4,7 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.webkit.CookieManager
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
 import androidx.core.view.ViewCompat
@@ -12,6 +13,7 @@ import com.sjianjun.reader.App
 import com.sjianjun.reader.BaseActivity
 import com.sjianjun.reader.R
 import com.sjianjun.reader.databinding.ActivityVerificationBinding
+import com.sjianjun.reader.http.CloudflareChallengeDetector
 import com.sjianjun.reader.module.bookcity.AdBlock
 import com.sjianjun.reader.module.bookcity.CustomWebView
 import com.sjianjun.reader.module.browser.BrowserTab
@@ -44,6 +46,10 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
         intent.getSerializableExtra(KEY_HEADER_MAP) as? Map<String, String> ?: mapOf()
     }
     private val postData: ByteArray? by lazy { intent.getByteArrayExtra(KEY_POST_DATA) }
+    /** When true, finish automatically once CookieManager has cf_clearance for this URL. */
+    private val autoCfClearance: Boolean by lazy {
+        intent.getBooleanExtra(KEY_AUTO_CF_CLEARANCE, false)
+    }
     private val mHandler = Handler(Looper.getMainLooper())
     private var runnable: EvalJsRunnable? = null
     private var finishing = false
@@ -133,6 +139,10 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
     }
 
     private fun initView() {
+        if (autoCfClearance) {
+            binding.tvTitle.text = "Cloudflare 验证"
+            binding.tvDesc.text = "通过后将自动关闭；交互验证请点击完成"
+        }
         binding.btnDone.click {
             finishWithCurrentContent()
         }
@@ -144,6 +154,16 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
                 finishWithCurrentContent()
                 true
             }
+        }
+    }
+
+    /** True when shared CookieManager already holds cf_clearance for the challenge URL. */
+    private fun hasCfClearanceCookie(): Boolean {
+        return try {
+            val cookie = CookieManager.getInstance().getCookie(url)
+            CloudflareChallengeDetector.hasClearanceCookie(cookie)
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -235,6 +255,7 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
         private val KEY_HEADER_MAP = "header_map"
         private val KEY_POST_DATA = "post_data"
         private val KEY_VERIFICATION_KEY = "VerificationKey"
+        private val KEY_AUTO_CF_CLEARANCE = "auto_cf_clearance"
         private val KEY_RESULT = "result"
         private val resultMap = mutableMapOf<String, Result>()
 
@@ -248,7 +269,12 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
         /** activity 启动兜底超时：若届时 activity 仍未起来（如后台启动受限），放行后续请求，避免永久阻塞。 */
         private const val VERIFICATION_START_TIMEOUT_MS = 15 * 1000L
 
-        fun postAndWaitResult(url: String, postData: String, verificationKey: String = ""): String? =
+        fun postAndWaitResult(
+            url: String,
+            postData: String,
+            verificationKey: String = "",
+            autoCfClearance: Boolean = false,
+        ): String? =
             synchronized(verificationLock) {
                 Log.i("WebViewVerificationActivity postAndWaitResult URL: $url, postData: $postData")
                 if (Looper.myLooper() == Looper.getMainLooper()) {
@@ -262,6 +288,7 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
                     putExtra(KEY_POST_DATA, postData.toByteArray())
                     putExtra(KEY_RESULT, keyResult)
                     putExtra(KEY_VERIFICATION_KEY, verificationKey)
+                    putExtra(KEY_AUTO_CF_CLEARANCE, autoCfClearance)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 val result = Result(url)
@@ -279,9 +306,15 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
             }
 
         @JvmStatic
-        fun startAndWaitResult(url: String, headerMap: Map<String, String> = mapOf(), verificationKey: String = ""): String? =
+        @JvmOverloads
+        fun startAndWaitResult(
+            url: String,
+            headerMap: Map<String, String> = mapOf(),
+            verificationKey: String = "",
+            autoCfClearance: Boolean = false,
+        ): String? =
             synchronized(verificationLock) {
-                Log.i("WebViewVerificationActivity startAndWaitResult URL: $url, headerMap: $headerMap")
+                Log.i("WebViewVerificationActivity startAndWaitResult URL: $url, headerMap: $headerMap, autoCf=$autoCfClearance")
                 if (Looper.myLooper() == Looper.getMainLooper()) {
                     throw IllegalStateException("startAndWaitResult 必须在子线程中调用")
                 }
@@ -293,6 +326,7 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
                     putExtra(KEY_HEADER_MAP, HashMap(headerMap))
                     putExtra(KEY_RESULT, keyResult)
                     putExtra(KEY_VERIFICATION_KEY, verificationKey)
+                    putExtra(KEY_AUTO_CF_CLEARANCE, autoCfClearance)
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 val result = Result(url)
@@ -358,6 +392,12 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
 
         override fun run() {
             if (destroyed) return
+            // CF mode: poll CookieManager so JS challenges that auto-set cf_clearance finish without tapping 完成
+            if (autoCfClearance && hasCfClearanceCookie()) {
+                Log.i("WebViewVerificationActivity cf_clearance detected for $url")
+                finishWithCurrentContent()
+                return
+            }
             customWebView.webView?.evaluateJavascript(mJavaScript) {
                 handleResult(it)
             }
@@ -365,6 +405,10 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
 
         private fun handleResult(result: String) = GlobalScope.launch {
             if (destroyed) return@launch
+            if (autoCfClearance && hasCfClearanceCookie()) {
+                mHandler.post { finishWithCurrentContent() }
+                return@launch
+            }
             if (!result.isBlank() && result != "null") {
                 val content = parseJsString(result)
                 Log.i("js执行结果获取成功：$url")
@@ -376,6 +420,12 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
                 if (verificationKey.isNotBlank() && content.contains(verificationKey)) {
                     res?.finished = true
                     finish()
+                    return@launch
+                }
+                // Keep polling in CF mode until clearance cookie appears or user taps 完成
+                if (autoCfClearance && !isDestroyed && !destroyed) {
+                    retry++
+                    mHandler.postDelayed(this@EvalJsRunnable, 800)
                 }
                 return@launch
             }

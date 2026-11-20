@@ -305,8 +305,137 @@ def _install_dns_hook():
         pass
 
 
+# Cloudflare WebView bridge: inject cookies/UA at the shared requests layer so book sources
+# keep the same search/getDetails/getChapterContent API without per-site CF code.
+_CF_BODY_SNIPPET = 8192
+_CF_RETRY_ATTR = "_cf_bridge_retried"
+
+
+def _cf_bridge():
+    """Lazy import of Kotlin CloudflareCookieBridge (unavailable in pure-Python unit tests)."""
+    try:
+        from com.sjianjun.reader.http import CloudflareCookieBridge
+        return CloudflareCookieBridge
+    except Exception:
+        return None
+
+
+def _request_url(args, kwargs):
+    if len(args) >= 2:
+        return args[1]
+    return kwargs.get("url")
+
+
+def _header_dict(kwargs):
+    headers = kwargs.get("headers")
+    if headers is None:
+        return {}
+    try:
+        return dict(headers)
+    except Exception:
+        return {}
+
+
+def _apply_cf_credentials(kwargs, creds):
+    """Merge CF cookie + matching User-Agent into the outgoing request kwargs."""
+    if not creds:
+        return kwargs
+    cookie = creds.get("cookie") or ""
+    ua = creds.get("userAgent") or ""
+    headers = _header_dict(kwargs)
+    if ua:
+        # Clearance is bound to the UA that earned it — override any source UA.
+        headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+        headers["User-Agent"] = ua
+    if cookie:
+        existing = ""
+        for k, v in list(headers.items()):
+            if k.lower() == "cookie":
+                existing = v or ""
+                del headers[k]
+                break
+        if existing:
+            # Prefer WebView cookies for names that overlap (cf_clearance etc.).
+            merged = {}
+            for part in (existing + ";" + cookie).split(";"):
+                part = part.strip()
+                if not part or "=" not in part:
+                    continue
+                name, value = part.split("=", 1)
+                merged[name.strip()] = value.strip()
+            cookie = "; ".join("%s=%s" % (n, v) for n, v in merged.items() if n)
+        headers["Cookie"] = cookie
+    kwargs = dict(kwargs)
+    kwargs["headers"] = headers
+    return kwargs
+
+
+def _response_headers_map(response):
+    try:
+        return {str(k): str(v) for k, v in response.headers.items()}
+    except Exception:
+        return {}
+
+
+def _is_cf_challenge_response(response):
+    bridge = _cf_bridge()
+    if bridge is None:
+        return False
+    try:
+        body = ""
+        try:
+            # Prefer text for HTML markers; fall back to raw bytes decode.
+            body = (response.text or "")[:_CF_BODY_SNIPPET]
+        except Exception:
+            try:
+                body = (response.content or b"")[:_CF_BODY_SNIPPET].decode("utf-8", "ignore")
+            except Exception:
+                body = ""
+        return bool(bridge.isChallenge(int(response.status_code), _response_headers_map(response), body))
+    except Exception:
+        return False
+
+
+def _ensure_cf_credentials(url, headers, force=False):
+    bridge = _cf_bridge()
+    if bridge is None or not url:
+        return None
+    check_aborted()
+    try:
+        from java.util import HashMap
+        java_headers = HashMap()
+        for key, value in (headers or {}).items():
+            java_headers.put(str(key), str(value))
+        return bridge.ensureCredentials(url, java_headers, force)
+    except ScriptAborted:
+        raise
+    except BaseException as e:
+        if is_cancelled_exception(e):
+            raise ScriptAborted("脚本任务已取消")
+        return None
+
+
+def _prefetch_cf_credentials(url, headers):
+    """Reuse cache / CookieManager without opening WebView."""
+    bridge = _cf_bridge()
+    if bridge is None or not url:
+        return None
+    try:
+        cached = bridge.getCachedCredentials(url)
+        if cached:
+            return cached
+        ua = None
+        for k, v in (headers or {}).items():
+            if str(k).lower() == "user-agent":
+                ua = str(v)
+                break
+        return bridge.refreshFromCookieManager(url, ua)
+    except Exception:
+        return None
+
+
 def _install_requests_hooks():
-    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时。"""
+    """脚本直接用 requests 时：调用前拦截 + 取消后统一异常 + 未指定时的默认超时 + CF cookie 桥。"""
     try:
         import requests
         if getattr(requests.Session.request, "_liter_reader_patched", False):
@@ -319,12 +448,38 @@ def _install_requests_hooks():
             # 建连超时设短一点，DNS/握手卡住时能快速失败，脚本好重试或降级）
             if "timeout" not in kwargs and len(args) < 9:
                 kwargs["timeout"] = (DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT)
+
+            url = _request_url(args, kwargs)
+            headers = _header_dict(kwargs)
+            # Silent reuse: cached host cookies / in-app browser CookieManager.
+            # Do not open WebView here — only after a challenge response.
+            creds = _prefetch_cf_credentials(url, headers)
+            if creds:
+                kwargs = _apply_cf_credentials(kwargs, creds)
+
             try:
-                return orig_request(self, *args, **kwargs)
+                response = orig_request(self, *args, **kwargs)
             except BaseException:
                 if _is_aborted(key):
                     raise ScriptAborted("脚本任务已取消")
                 raise
+
+            # One automatic CF solve + retry per request (avoid loops).
+            already = getattr(self, _CF_RETRY_ATTR, False)
+            if (not already) and url and _is_cf_challenge_response(response):
+                check_aborted()
+                solved = _ensure_cf_credentials(url, _header_dict(kwargs), force=True)
+                if solved:
+                    try:
+                        setattr(self, _CF_RETRY_ATTR, True)
+                        retry_kwargs = _apply_cf_credentials(dict(kwargs), solved)
+                        response = orig_request(self, *args, **retry_kwargs)
+                    finally:
+                        try:
+                            setattr(self, _CF_RETRY_ATTR, False)
+                        except Exception:
+                            pass
+            return response
 
         requests.Session.request = _mark_patched(request)
     except Exception:
