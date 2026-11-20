@@ -46,20 +46,20 @@ class SearchViewModel : ViewModel() {
     suspend fun saveSearchResult(searchResult: List<SearchResult>): String = withIo {
         val incoming = searchResult.filter { !it.bookSource?.id.isNullOrBlank() }.toBookList()
         if (incoming.isEmpty()) return@withIo ""
-        // 同一书源内只看 URL **相对站点域名的路径**是否重复：
-        // http/https、www/m 等镜像域名不同但路径相同，视为同一本书；
-        // 路径不同则是两本书（即使书名/作者相同）。
+        // 书籍唯一性以书名、作者、来源 3 者确定（见 Book 类注释）：
+        // 同一书源内同书名同作者即同一本书——站方常把同一本书挂在多个书号下
+        // （URL 路径不同），按路径判定会把同一本当成多本、越存越多；
+        // 作者为空时退回按 URL 路径判定，避免把同名不同作者的书误合并。
         // 优先复用数据库已有的（章节/阅读进度都挂在它的 id 上）。
         val sourceBooks = HashMap<String, List<Book>>()
         val byKey = LinkedHashMap<String, Book>()
         incoming.forEach { book ->
-            val key = "${book.bookSourceId}|${relativeBookPath(book.url)}"
+            val key = dedupKey(book.bookSourceId, book.title, book.author, book.url)
             val existing = byKey[key] ?: run {
                 val books = sourceBooks.getOrPut(book.bookSourceId) {
                     bookDao.getBooksBySourceId(book.bookSourceId)
                 }
-                val path = relativeBookPath(book.url)
-                books.firstOrNull { relativeBookPath(it.url) == path }
+                books.firstOrNull { sameBook(it, book) }
             }
             byKey[key] = existing ?: book
         }
@@ -164,18 +164,40 @@ class SearchViewModel : ViewModel() {
     /**
      * 把搜索结果加入分组（同一本书去重）。
      *
-     * 同一书源内按 URL **相对站点域名的路径**判定：镜像域名/协议不同但路径相同视为同一本
-     * （通用搜索源和书源自身可能重复返回）；不同书源的同路径书籍保留，换源时要用。
+     * 同一书源内按书名+作者判定：站方常把同一本书挂在多个书号下（URL 路径不同），
+     * 按路径判定会把同一本当成多本（搜出「共2个」）；作者为空时退回按 URL 路径判定。
+     * 不同书源的同名同作者书籍保留，换源时要用。
      */
     internal fun addSearchResult(
         group: MutableMap<String, MutableList<SearchResult>>,
         seen: MutableSet<String>,
         result: SearchResult,
     ) {
-        // 同一书源内只看相对站点域名的路径（镜像域名/协议不同但路径相同 = 同一本）
+        // 同书名同作者 + 同一书源 = 同一本（与分组键 title 一致，另加作者与书源区分）
         val sourceId = result.bookSource?.id.orEmpty()
-        if (!seen.add("${result.key}|${relativeBookPath(result.bookUrl)}|$sourceId")) return
+        if (!seen.add(dedupKey(sourceId, result.bookTitle, result.bookAuthor, result.bookUrl))) return
         group.getOrPut(result.key) { mutableListOf() }.add(result)
+    }
+
+    /**
+     * 同一书源内判定两本书是否同一本的键：书名+作者优先（见 Book 类注释，
+     * 书籍唯一性以书名、作者、来源 3 者确定）；作者为空时退回 URL 相对路径。
+     */
+    internal fun dedupKey(sourceId: String, title: String, author: String, url: String): String {
+        return if (author.isNotBlank()) {
+            "$sourceId|title:$title|author:$author"
+        } else {
+            "$sourceId|path:${relativeBookPath(url)}"
+        }
+    }
+
+    /** 与 [dedupKey] 同规则的等价判定，用于在数据库已有书籍中找可复用的一本。 */
+    internal fun sameBook(a: Book, b: Book): Boolean {
+        return if (a.author.isNotBlank() && b.author.isNotBlank()) {
+            a.title == b.title && a.author == b.author
+        } else {
+            relativeBookPath(a.url) == relativeBookPath(b.url)
+        }
     }
 
     /**
