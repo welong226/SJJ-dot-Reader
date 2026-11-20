@@ -410,18 +410,35 @@ def _webview_host_forget(host):
         _CF_WEBVIEW_HOSTS.pop(host, None)
 
 
+# Cloudflare 托管验证是“等几秒自动放行”，但 BackstageWebView 在 onPageFinished
+# 后约 1 秒就取 outerHTML——永远拿到验证页本身，降级于是永远失败。
+# 改传一段 JS：验证页还在就回空字串，触发 Java 侧既有的“空白重试”循环
+# （每秒重取、最多约 30 次）；验证通过、拿到真页面才回 HTML。
+# 注意：只等“暂时的”验证页（标题 Just a moment / 请稍候，或含 cf-challenge
+# 标记）；硬拦截页（Attention Required）不等，照常回 HTML 让上层按标记拒绝。
+_CF_WAIT_JS = (
+    "(function(){"
+    "var t=document.title||'';"
+    "var h=document.documentElement.outerHTML;"
+    "if(/just a moment|\\u8bf7\\u7a0d\\u5019/i.test(t)"
+    "||h.indexOf('cf-challenge')>=0||h.indexOf('challenge-platform')>=0)return '';"
+    "return h;})()"
+)
+
+
 def _webview_fetch(method, url, headers, data=None, timeout=_CF_WEBVIEW_TIMEOUT):
     """经后台 WebView 抓一页，返回 (final_url, html)；失败返回 (None, None)。
 
     web_get/web_post 返回的是 JSON 字符串 {"url": ..., "html": ...}。
     懒加载 import，避免与 WebViewClient.py 的循环引用（它 import exec_script）。
+    传 _CF_WAIT_JS：验证页还在时回空字串，让 Java 侧重试循环等验证通过。
     """
     try:
         from WebViewClient import web_get, web_post
         if method == "POST":
-            raw = web_post(url, data or "", timeout=int(timeout * 1000))
+            raw = web_post(url, data or "", _CF_WAIT_JS, timeout=int(timeout * 1000))
         else:
-            raw = web_get(url, headers or {}, timeout=int(timeout * 1000))
+            raw = web_get(url, headers or {}, _CF_WAIT_JS, timeout=int(timeout * 1000))
         if not raw:
             return None, None
         parsed = json.loads(raw)
