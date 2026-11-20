@@ -2,6 +2,15 @@ name: assembleRelease
 
 on:
   workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
 
 # create-release 需要用 token 创建 Release，必须显式授予写权限（新仓库默认只读）
 permissions:
@@ -68,11 +77,11 @@ jobs:
           echo "sign.keyPassword=${{ secrets.KEY_PASSWORD }}" >> local.properties
           echo "python=$(which python)" >> local.properties
 
-      - name: Build and sign APK
+      - name: Build APK
         run: |
           chmod +x gradlew
-          ./gradlew :app:assembleRelease
-          ls app/build/outputs/apk/release/
+          ./gradlew :app:assemble${{ inputs.build_type }}
+          ls app/build/outputs/apk/
 
       - name: Get APK version info
         run: |
@@ -80,7 +89,7 @@ jobs:
           # 动态取最新 aapt，避免 build-tools 版本升级后写死路径失效
           aapt=$(ls -1 "$ANDROID_HOME"/build-tools/*/aapt | sort -V | tail -n 1)
           echo "aapt: $aapt"
-          apk_file=$(ls app/build/outputs/apk/release/*.apk | tail -n 1)
+          apk_file=$(ls app/build/outputs/apk/*/*.apk | tail -n 1)
           version_code=$("$aapt" dump badging "$apk_file" | awk '/versionCode/ {print $3}' | cut -d"'" -f2)
           version_name=$("$aapt" dump badging "$apk_file" | awk '/versionName/ {print $4}' | cut -d"'" -f2)
           echo "APK_FILE=$apk_file" >> $GITHUB_ENV
@@ -93,12 +102,21 @@ jobs:
           echo "TAG_NAME=$version_name"
 
       - name: Upload to Pgyer
+        if: inputs.build_type == 'Release'
         run: |
           chmod +x ./pgyer_upload.sh
           bash ./pgyer_upload.sh -k ${{ secrets.PGY_KEY }} -d ${{env.CHANGELOG}} "${{ env.APK_FILE }}"
 
+      - name: Upload debug APK
+        if: inputs.build_type == 'Debug'
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/*.apk
+
       # 用 action-gh-release 替代已归档的 actions/create-release@v1 + actions/upload-release-asset@v1
       - name: Create Release
+        if: inputs.build_type == 'Release'
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUBTOKEN }}
