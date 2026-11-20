@@ -310,7 +310,8 @@ def _install_dns_hook():
 # 目标：书源一行都不用改。requests 拿到 Cloudflare 验证页时，自动用后台 WebView
 # （真浏览器，会跑 JS）重抓一次，把回来的 HTML 包成 requests.Response 还给书源。
 # 触发条件：HTTP 403/503 + 页面像 Cloudflare 验证页，或 403/503 + 响应头带 cf-ray
-# 且 Content-Type 是 HTML（JSON 接口的 403 不触发，避免把 JSON 包成 HTML）。
+# 且 Content-Type 是 HTML（JSON 接口的 403 不触发，避免把 JSON 包成 HTML）；
+# 另外，连接层直接被挡（服务器断线、ConnectionError 等，无响应可判断）时也改走 WebView。
 # 另外两个优化：
 #   1) 某域名经 WebView 成功一次后记下来（_CF_WEBVIEW_HOSTS，默认 30 分钟），
 #      其间同域名请求直接走 WebView，不再先浪费一次被挡的 requests；
@@ -562,9 +563,20 @@ def _install_requests_hooks():
             # 2) 正常 requests
             try:
                 resp = orig_request(self, *args, **kwargs)
-            except BaseException:
+            except BaseException as e:
                 if _is_aborted(key):
                     raise ScriptAborted("脚本任务已取消")
+                # 连接层被挡（例如服务器直接断线、ConnectionError）：没有响应可判断，
+                # 改走 WebView 试一次；WebView 也失败再抛原始异常。
+                try:
+                    if isinstance(e, requests.exceptions.RequestException):
+                        synth = _try_webview(self, method, url, kwargs)
+                        if synth is not None:
+                            return synth
+                except BaseException:
+                    if _is_aborted(key):
+                        raise ScriptAborted("脚本任务已取消")
+                    pass
                 raise
             # 3) 命中 Cloudflare 验证页：改走 WebView 重抓
             try:
