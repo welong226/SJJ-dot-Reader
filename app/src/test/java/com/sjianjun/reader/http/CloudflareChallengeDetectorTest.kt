@@ -95,4 +95,23 @@ class CloudflareChallengeDetectorTest {
             )
         )
     }
+
+    @Test
+    fun usableContentHtmlRequiresBookSignals() {
+        assertFalse(
+            CloudflareChallengeDetector.isUsableContentHtml(
+                "<html><title>Just a moment...</title><script>window._cf_chl_opt={}</script></html>",
+            )
+        )
+        assertTrue(
+            CloudflareChallengeDetector.isUsableContentHtml(
+                """
+                <html><head>
+                <meta property="og:novel:book_name" content="撈屍人"/>
+                <meta property="og:novel:author" content="某人"/>
+                </head><body><div id="catalog"><ul><li><a href="/1">c1</a></li></ul></div></body></html>
+                """.trimIndent(),
+            )
+        )
+    }
 }

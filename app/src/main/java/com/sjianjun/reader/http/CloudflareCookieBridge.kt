@@ -256,19 +256,22 @@ object CloudflareCookieBridge {
 
         flushCookies()
 
-        val cookie = mergeCookiesForHost(url) ?: mergeCookiesForHost(challengeUrl)
-        if (cookie.isNullOrBlank() || !CloudflareChallengeDetector.hasClearanceCookie(cookie)) {
-            Log.e("CloudflareCookieBridge no cf_clearance after WebView for $host")
+        val cookie = mergeCookiesForHost(url) ?: mergeCookiesForHost(challengeUrl) ?: ""
+        val hasClearance = CloudflareChallengeDetector.hasClearanceCookie(cookie)
+        val usableHtml = pageHtml.takeIf { html ->
+            CloudflareChallengeDetector.isUsableContentHtml(html)
+        }.orEmpty()
+
+        // Prefer usable WebView HTML for getDetails even if clearance is still settling —
+        // previously returning null here discarded a fully loaded book page and left search blank.
+        if (!hasClearance && usableHtml.isEmpty()) {
+            Log.e("CloudflareCookieBridge no cf_clearance and no usable HTML after WebView for $host")
             return null
         }
-        val usableHtml = pageHtml.takeIf { html ->
-            html.isNotBlank() &&
-                !CloudflareChallengeDetector.isChallenge(
-                    200,
-                    mapOf("server" to "cloudflare"),
-                    html.take(8192),
-                )
-        }.orEmpty()
+        if (!hasClearance) {
+            Log.i("CloudflareCookieBridge using WebView HTML without cf_clearance for $host")
+        }
+
         val creds = Credentials(
             cookie = cookie,
             userAgent = ua,
@@ -277,10 +280,13 @@ object CloudflareCookieBridge {
             html = usableHtml,
             htmlUrl = pageUrl,
         )
-        cache[host] = creds
-        twinHost(host)?.let { twin -> cache[twin] = creds.copy(host = twin) }
+        if (hasClearance) {
+            cache[host] = creds
+            twinHost(host)?.let { twin -> cache[twin] = creds.copy(host = twin) }
+        }
         Log.i(
-            "CloudflareCookieBridge solved CF for $host htmlLen=${usableHtml.length} pageUrl=$pageUrl"
+            "CloudflareCookieBridge solved CF for $host clearance=$hasClearance " +
+                "htmlLen=${usableHtml.length} pageUrl=$pageUrl"
         )
         // includeHtml=true only on the live solve path (not cache hits).
         return creds.toMap(includeHtml = true)

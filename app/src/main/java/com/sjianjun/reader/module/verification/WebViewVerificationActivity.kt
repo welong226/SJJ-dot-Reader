@@ -69,6 +69,13 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
     @Volatile
     private var pageReady = false
 
+    /** Last HTML fingerprint that looked usable; require two stable polls before auto-finish. */
+    @Volatile
+    private var lastUsableHtmlFingerprint: Int = 0
+
+    @Volatile
+    private var stableUsablePolls: Int = 0
+
     @Volatile
     private var destroyed = false
 
@@ -194,32 +201,40 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
     private fun initView() {
         if (autoCfClearance) {
             binding.tvTitle.text = "Cloudflare 验证"
-            binding.tvDesc.text = "等待挑战完成将自动关闭；若需点击勾选请完成后点右上角完成"
+            binding.tvDesc.text = "Waiting… 看到书籍正文后点右上角「完成」；验证成功后也会自动关闭"
         }
         binding.btnDone.click {
-            finishWithCurrentContent()
+            attemptFinish(userRequested = true)
         }
         setOnBackPressed {
             if (binding.customWebView.webView?.canGoBack() == true) {
                 binding.customWebView.webView?.goBack()
                 true
             } else {
-                finishWithCurrentContent()
+                attemptFinish(userRequested = true)
                 true
             }
         }
     }
 
-    /** Current cf_clearance cookie value for [url] (null if missing). */
+    /** Current cf_clearance cookie value for the challenge URL and the live WebView URL. */
     private fun clearanceCookieValue(): String? {
         return try {
-            val cookie = CookieManager.getInstance().getCookie(url) ?: return null
-            cookie.split(';').asSequence()
-                .map { it.trim() }
-                .firstOrNull { it.startsWith("cf_clearance=", ignoreCase = true) }
-                ?.substringAfter('=')
-                ?.trim()
-                ?.takeIf { it.isNotEmpty() }
+            val cm = CookieManager.getInstance()
+            val urls = linkedSetOf(url)
+            binding.customWebView.webView?.url?.let { urls.add(it) }
+            for (u in urls) {
+                if (u.isBlank() || u == "about:blank") continue
+                val cookie = cm.getCookie(u) ?: continue
+                val value = cookie.split(';').asSequence()
+                    .map { it.trim() }
+                    .firstOrNull { it.startsWith("cf_clearance=", ignoreCase = true) }
+                    ?.substringAfter('=')
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                if (value != null) return value
+            }
+            null
         } catch (_: Exception) {
             null
         }
@@ -243,6 +258,44 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
     }
 
     /**
+     * Auto-finish only with fresh clearance + usable post-challenge HTML (stable across polls).
+     * User tapping 完成 may finish with usable HTML even if clearance is still settling.
+     */
+    private fun canAutoFinish(content: String): Boolean {
+        if (!autoCfClearance) return false
+        if (!pageReady) return false
+        if (!hasFreshCfClearanceCookie()) return false
+        if (!CloudflareChallengeDetector.isUsableContentHtml(content)) return false
+        val fp = content.length xor content.take(200).hashCode() xor content.takeLast(200).hashCode()
+        if (fp == lastUsableHtmlFingerprint) {
+            stableUsablePolls++
+        } else {
+            lastUsableHtmlFingerprint = fp
+            stableUsablePolls = 1
+        }
+        return stableUsablePolls >= 2
+    }
+
+    private fun attemptFinish(userRequested: Boolean) {
+        if (finishing) return
+        val resultKey = intent.getStringExtra(KEY_RESULT)
+        val cachedHtml = resultMap[resultKey]?.html.orEmpty()
+        if (userRequested) {
+            val usable = CloudflareChallengeDetector.isUsableContentHtml(cachedHtml)
+            val cleared = hasFreshCfClearanceCookie()
+            if (!usable && !cleared) {
+                // Still on challenge / blank — keep waiting so search does not return empty.
+                Log.i("WebViewVerificationActivity 完成 ignored: no clearance and HTML not usable")
+                binding.tvDesc.text = "仍在验证中，请完成勾选或等待正文加载后再点「完成」"
+                return
+            }
+            finishWithCurrentContent()
+            return
+        }
+        // Auto path is handled directly from EvalJsRunnable via canAutoFinish → finishWithCurrentContent.
+    }
+
+    /**
      * 关闭页面时抓取当前 WebView 内容作为返回结果。
      * evaluateJavascript 为异步，回调中写入结果后再 finish；
      * 并设置兜底定时器，避免回调未触发导致页面无法关闭。
@@ -250,6 +303,7 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
     private fun finishWithCurrentContent() {
         if (finishing) return
         finishing = true
+        runnable?.let { mHandler.removeCallbacks(it) }
         val resultKey = intent.getStringExtra(KEY_RESULT)
         val wv = binding.customWebView.webView
         if (wv == null) {
@@ -261,13 +315,17 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
         wv.evaluateJavascript("document.documentElement.outerHTML") { raw ->
             val content = parseJsString(raw)
             resultMap[resultKey]?.let {
-                if (content.isNotEmpty()) it.html = content
+                if (content.isNotEmpty()) {
+                    it.html = content
+                    it.url = wv.url ?: it.url
+                }
                 it.finished = true
             }
             mHandler.removeCallbacks(finishFallback)
             if (!isFinishing && !isDestroyed) finish()
         }
-        mHandler.postDelayed(finishFallback, 1500)
+        // Longer fallback: large book pages can make evaluateJavascript slow.
+        mHandler.postDelayed(finishFallback, 4000)
     }
 
     private fun parseJsString(raw: String?): String {
@@ -475,24 +533,22 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
         var retry = 0
 
         override fun run() {
-            if (destroyed) return
-            // CF mode: only finish on a *fresh* clearance after the document has content.
-            if (autoCfClearance && pageReady && hasFreshCfClearanceCookie()) {
-                Log.i("WebViewVerificationActivity fresh cf_clearance detected for $url")
-                finishWithCurrentContent()
-                return
-            }
+            if (destroyed || finishing) return
+            // Never auto-finish from cookie alone — need usable HTML confirmed in handleResult.
             customWebView.webView?.evaluateJavascript(mJavaScript) {
                 handleResult(it)
             }
         }
 
         private fun handleResult(result: String) = GlobalScope.launch {
-            if (destroyed) return@launch
+            if (destroyed || finishing) return@launch
             if (!result.isBlank() && result != "null") {
                 val content = parseJsString(result)
                 markPageReadyIfNeeded(content)
-                Log.i("js执行结果获取成功：$url ready=$pageReady len=${content.length}")
+                Log.i(
+                    "js执行结果获取成功：$url ready=$pageReady len=${content.length} " +
+                        "clearance=${hasFreshCfClearanceCookie()} usable=${CloudflareChallengeDetector.isUsableContentHtml(content)}"
+                )
                 val resultKey = intent.getStringExtra(KEY_RESULT)
                 val res = resultMap[resultKey]
                 res?.url = customWebView.webView?.url ?: url
@@ -503,27 +559,19 @@ class WebViewVerificationActivity : BaseActivity(), TabHost {
                     mHandler.post { finish() }
                     return@launch
                 }
-                val stillChallenged = CloudflareChallengeDetector.isChallenge(
-                    403,
-                    mapOf("server" to "cloudflare"),
-                    content.take(8192),
-                )
-                if (autoCfClearance && pageReady && hasFreshCfClearanceCookie() && !stillChallenged) {
+                if (autoCfClearance && canAutoFinish(content)) {
+                    Log.i("WebViewVerificationActivity auto-finish: clearance + stable usable HTML")
                     mHandler.post { finishWithCurrentContent() }
                     return@launch
                 }
-                if (autoCfClearance && pageReady && hasFreshCfClearanceCookie() && stillChallenged) {
-                    // Cookie appeared but HTML still looks like challenge — keep waiting briefly.
-                    Log.i("WebViewVerificationActivity clearance set but page still looks challenged")
-                }
-                // Keep polling in CF mode until clearance cookie appears or user taps 完成
-                if (autoCfClearance && !isDestroyed && !destroyed) {
+                // Keep polling in CF mode until clearance + usable HTML, or user taps 完成.
+                if (autoCfClearance && !isDestroyed && !destroyed && !finishing) {
                     retry++
                     mHandler.postDelayed(this@EvalJsRunnable, 800)
                 }
                 return@launch
             }
-            if (isDestroyed || destroyed) {
+            if (isDestroyed || destroyed || finishing) {
                 return@launch
             }
             retry++

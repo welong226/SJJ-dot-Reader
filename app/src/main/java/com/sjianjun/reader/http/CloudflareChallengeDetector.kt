@@ -87,6 +87,27 @@ object CloudflareChallengeDetector {
         }
     }
 
+    /**
+     * True when [html] looks like a real site page after CF (book details / toc), not a challenge shell.
+     * Used to gate auto-finish of the verification WebView and to accept WebView HTML for getDetails.
+     */
+    @JvmStatic
+    fun isUsableContentHtml(html: String?): Boolean {
+        if (html.isNullOrBlank()) return false
+        if (isChallenge(200, mapOf("server" to "cloudflare"), html.take(8192))) {
+            return false
+        }
+        val sample = html
+        // Strong book/toc signals used by so-novel / Legado CSS rules.
+        if (sample.contains("og:novel:book_name", ignoreCase = true)) return true
+        if (sample.contains("og:novel:author", ignoreCase = true)) return true
+        if (sample.contains("id=\"catalog\"", ignoreCase = true)) return true
+        if (sample.contains("id='catalog'", ignoreCase = true)) return true
+        // Substantial non-challenge document (homepage / listing after clearance).
+        if (sample.length >= 4_000 && sample.contains("<body", ignoreCase = true)) return true
+        return false
+    }
+
     private fun normalizeHeaders(headers: Map<String, String>?): Map<String, String> {
         if (headers.isNullOrEmpty()) return emptyMap()
         val out = HashMap<String, String>(headers.size)

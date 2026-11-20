@@ -527,13 +527,41 @@ def _synthetic_html_response(url, html, encoding="utf-8"):
     return resp
 
 
+def _normalize_book_path(path):
+    """Normalize /book/123.htm vs /book/123/ for CF HTML reuse checks."""
+    p = (path or "/").rstrip("/")
+    lower = p.lower()
+    for suffix in (".htm", ".html"):
+        if lower.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
+    return p.rstrip("/")
+
+
+def _html_looks_usable_for_details(html):
+    if not html or not str(html).strip():
+        return False
+    if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+        return False
+    sample = html
+    if "og:novel:book_name" in sample or "og:novel:author" in sample:
+        return True
+    if 'id="catalog"' in sample or "id='catalog'" in sample:
+        return True
+    if len(sample) >= 4000 and "<body" in sample.lower():
+        return True
+    return False
+
+
 def _html_from_cf_creds(creds, request_url):
-    """Use WebView HTML only when it belongs to this request URL (same path)."""
+    """Use WebView HTML for this request when it is usable post-challenge content.
+
+    Accept same-host book pages even when path differs only by .htm vs trailing slash.
+    Live solve HTML with book markers is accepted for the challenged request URL.
+    """
     data = _creds_map(creds)
     html = data.get("html") or ""
-    if not html.strip():
-        return None
-    if _py_is_cf_challenge(200, {"server": "cloudflare"}, html[:_CF_BODY_SNIPPET]):
+    if not _html_looks_usable_for_details(html):
         return None
     html_url = data.get("htmlUrl") or ""
     if html_url and request_url:
@@ -541,19 +569,21 @@ def _html_from_cf_creds(creds, request_url):
             from urllib.parse import urlparse
             a = urlparse(request_url)
             b = urlparse(html_url)
-            # Same host (+ www twin) and same path → safe to reuse page body.
             ha = (a.hostname or "").lower().lstrip("www.")
             hb = (b.hostname or "").lower().lstrip("www.")
-            pa = (a.path or "/").rstrip("/")
-            pb = (b.path or "/").rstrip("/")
-            if ha and hb and ha == hb and pa == pb:
-                return html
-            # Homepage solve for a deeper path is not usable as book HTML.
-            if pa and pa != pb:
+            if not (ha and hb and ha == hb):
                 return None
+            pa = _normalize_book_path(a.path)
+            pb = _normalize_book_path(b.path)
+            if pa == pb:
+                return html
+            # Same host + usable book HTML from the interactive solve for this request:
+            # allow when request path is a prefix/sibling book path (toc vs details).
+            if "/book/" in pa and "/book/" in pb and pa.split("/book/")[-1].split("/")[0] == pb.split("/book/")[-1].split("/")[0]:
+                return html
+            return None
         except Exception:
             pass
-    # No htmlUrl or parse failed — only accept for this request if caller just solved it.
     return html
 
 

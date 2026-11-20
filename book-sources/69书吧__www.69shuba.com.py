@@ -1430,14 +1430,18 @@ def run_details(source, url, last_chapter_url=""):
     author = eval_rule(info.get("author") or "", node, root, ctx).strip()
     cover = abs_url(eval_rule(info.get("coverUrl") or "", node, root, ctx), final)
     intro = eval_rule(info.get("intro") or "", node, root, ctx).strip()
+    # Prefer chapters already on the book page (#catalog) so a second CF toc fetch
+    # cannot wipe a successful details parse and leave search blank.
+    chapters = _chapters_from(source, doc, root, final, ctx)
     toc_url = ""
     if info.get("tocUrl"):
         toc_url = abs_url(eval_rule(info.get("tocUrl") or "", node, root, ctx), final)
     toc_url = _so_toc_url(source, url, final, toc_url)
-    if toc_url:
-        chapters = _collect_chapters(source, toc_url, ctx)
-    else:
-        chapters = _chapters_from(source, doc, root, final, ctx)
+    if toc_url and not chapters:
+        try:
+            chapters = _collect_chapters(source, toc_url, ctx)
+        except Exception:
+            chapters = _chapters_from(source, doc, root, final, ctx)
     if source.get("tocDesc"):
         chapters = list(reversed(chapters))
     return {
