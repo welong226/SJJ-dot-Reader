@@ -136,6 +136,7 @@ dependencies {
     implementation(libs.androidxConstraintlayout)
     implementation(libs.androidxRecyclerview)
     implementation(libs.androidxLegacySupportV4)
+    implementation(libs.androidxSecurityCrypto)
 
     implementation(libs.androidxNavigationFragmentKtx)
     implementation(libs.androidxNavigationUiKtx)
