@@ -20,6 +20,9 @@ import com.sjianjun.reader.R
 import com.sjianjun.reader.databinding.FragmentSettingsBinding
 import com.sjianjun.reader.preferences.globalConfig
 import com.sjianjun.reader.repository.DbFactory
+import com.sjianjun.reader.sync.PCloudCredentials
+import com.sjianjun.reader.sync.PCloudSyncManager
+import com.sjianjun.reader.sync.WebDavException
 import com.sjianjun.reader.utils.HttpServiceHelper
 import com.sjianjun.reader.utils.toast
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +31,10 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import sjj.alog.Log
 import java.io.File
+import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.coroutines.resume
 
 class SettingsFragment : Fragment() {
@@ -95,6 +102,26 @@ class SettingsFragment : Fragment() {
                 importDatabaseFileLauncher.launch(arrayOf("application/octet-stream", "application/x-sqlite3", "application/vnd.sqlite3", "*/*"))
             }
 
+            // pCloud 同步
+            pcloudEmailInput.setText(PCloudCredentials.email.orEmpty())
+            pcloudPasswordInput.setText(PCloudCredentials.password.orEmpty())
+            if (PCloudCredentials.server == PCloudCredentials.Server.EU) {
+                pcloudServerEu.isChecked = true
+            } else {
+                pcloudServerUs.isChecked = true
+            }
+            pcloudLastSyncValue.text = lastSyncText(PCloudCredentials.lastSyncAt)
+            pcloudUpload.setOnClickListener {
+                viewLifecycleOwner.lifecycleScope.launch {
+                    runPCloudSync(upload = true)
+                }
+            }
+            pcloudDownload.setOnClickListener {
+                viewLifecycleOwner.lifecycleScope.launch {
+                    runPCloudSync(upload = false)
+                }
+            }
+
             globalConfig.autoCheckUpdate.observe(viewLifecycleOwner) {
                 autoCheckUpdateSwitch.isChecked = it
             }
@@ -157,6 +184,52 @@ class SettingsFragment : Fragment() {
                 "用户数据：获取失败"
             }
         }
+    }
+
+    private fun lastSyncText(lastSyncAt: Long): String {
+        if (lastSyncAt <= 0L) return "上次同步：尚未同步"
+        val text = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(lastSyncAt))
+        return "上次同步：$text"
+    }
+
+    private fun syncErrorMessage(error: Throwable): String {
+        return when (error) {
+            is WebDavException -> error.message ?: "未知錯誤"
+            is IOException -> "連線失敗，請檢查網路"
+            else -> error.message ?: "未知錯誤"
+        }
+    }
+
+    private suspend fun FragmentSettingsBinding.runPCloudSync(upload: Boolean) {
+        val email = pcloudEmailInput.text?.toString()?.trim().orEmpty()
+        val password = pcloudPasswordInput.text?.toString().orEmpty()
+        if (email.isEmpty() || password.isEmpty()) {
+            toast("請先填入 pCloud 帳號與密碼")
+            return
+        }
+        pcloudUpload.isEnabled = false
+        pcloudDownload.isEnabled = false
+        runCatching {
+            withContext(Dispatchers.IO) {
+                PCloudCredentials.email = email
+                PCloudCredentials.password = password
+                PCloudCredentials.server = if (pcloudServerEu.isChecked) {
+                    PCloudCredentials.Server.EU
+                } else {
+                    PCloudCredentials.Server.US
+                }
+                if (upload) PCloudSyncManager.upload() else PCloudSyncManager.download()
+            }
+        }.onSuccess { stats ->
+            pcloudLastSyncValue.text = lastSyncText(PCloudCredentials.lastSyncAt)
+            val action = if (upload) "上傳" else "下載"
+            toast("pCloud 同步${action}完成：${stats.books} 本書、${stats.sources} 個書源、${stats.records} 筆閱讀進度")
+        }.onFailure {
+            Log.e("pCloud 同步失敗：${it.message ?: "未知錯誤"}", it)
+            toast("pCloud 同步失敗：${syncErrorMessage(it)}")
+        }
+        pcloudUpload.isEnabled = true
+        pcloudDownload.isEnabled = true
     }
 
     private fun formatBytes(bytes: Long): String {
