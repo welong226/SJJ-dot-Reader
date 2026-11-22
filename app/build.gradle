@@ -188,6 +188,9 @@ dependencies {
 
     implementation(libs.mmkvStatic)
 
+    // pCloud 同步帳密加密儲存（EncryptedSharedPreferences）
+    implementation(libs.androidxSecurityCrypto)
+
     // 设备兼容框架：https://github.com/getActivity/DeviceCompat
     implementation(libs.deviceCompat)
     // 权限请求框架：https://github.com/getActivity/XXPermissions

@@ -34,6 +34,7 @@ bugly = "4.1.9.3"
 superTextView = "v3.2.7"
 circleimageview = "3.1.0"
 mmkvStatic = "2.4.3"
+securityCrypto = "1.0.0"
 deviceCompat = "2.6"
 xxpermissions = "28.2"
 appupdate = "4.3.6"
@@ -122,6 +123,7 @@ buglyCrashreport = { module = "com.tencent.bugly:crashreport", version.ref = "bu
 superTextView = { module = "com.github.chenBingX:SuperTextView", version.ref = "superTextView" }
 circleimageview = { module = "de.hdodenhof:circleimageview", version.ref = "circleimageview" }
 mmkvStatic = { module = "com.tencent:mmkv-static", version.ref = "mmkvStatic" }
+androidxSecurityCrypto = { module = "androidx.security:security-crypto", version.ref = "securityCrypto" }
 deviceCompat = { module = "com.github.getActivity:DeviceCompat", version.ref = "deviceCompat" }
 xxpermissions = { module = "com.github.getActivity:XXPermissions", version.ref = "xxpermissions" }
 appupdate = { module = "io.github.azhon:appupdate", version.ref = "appupdate" }
