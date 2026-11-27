@@ -1196,6 +1196,15 @@ def fetch(url, source, method="GET", body=None, charset=None, extra_headers=None
 
 def abs_url(value, base):
     value = (value or "").strip()
+    # Multi-match rules join with newlines; URL fields must be a single href.
+    if "\n" in value or "\r" in value:
+        for line in value.splitlines():
+            line = line.strip()
+            if line and not line.startswith("javascript:") and not line.startswith("#"):
+                value = line
+                break
+        else:
+            return ""
     if not value or value.startswith("javascript:") or value.startswith("#"):
         return ""
     if value.startswith("data:"):
@@ -1379,7 +1388,7 @@ _SOURCE = json.loads(r"""{
   "ruleSearch": {
     "author": "tag.li.1@text",
     "bookList": "class.pure-u-1-1 pure-u-xl-1-3 pure-u-lg-1-3 pure-u-md-1-2 novel_cell",
-    "bookUrl": "tag.a@href",
+    "bookUrl": "tag.a.0@href",
     "coverUrl": "amp-img@src",
     "intro": "tag.li.2@text",
     "name": "h3@text"
@@ -1391,7 +1400,7 @@ _SOURCE = json.loads(r"""{
     "kind": "tag.li.2@text##類別：",
     "lastChapter": "class.near_chapter@all",
     "name": "h1@text",
-    "tocUrl": "baseUrl"
+    "tocUrl": "{{baseUrl}}"
   },
   "ruleToc": {
     "chapterList": "class.chapters_frame@class.pure-g@class.chapter_cell@tag.a",
